@@ -38,3 +38,24 @@ def list_account_channels(request: Request):
         }
         cards.append(card)
     return {"cards": cards}
+
+
+@router.get("/free-models")
+async def free_models(request: Request):
+    """拉取 OpenCode 免费池的模型清单（免登录，与网关转发同一指纹协议）。"""
+    require_admin(request)
+    import httpx
+    from . import opencode_free
+    session = opencode_free.mint_session_id()
+    headers = opencode_free.gateway_headers(session, stream=False)
+    headers["accept"] = "application/json"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(opencode_free.OPENCODE_BASE + opencode_free.LISTING_PATH, headers=headers)
+        if r.status_code != 200:
+            return {"ok": False, "error": f"上游 HTTP {r.status_code}", "models": []}
+        data = r.json().get("data") or []
+        models = [item.get("id") for item in data if isinstance(item, dict) and item.get("id")]
+        return {"ok": True, "models": models}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200], "models": []}

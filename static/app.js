@@ -9,6 +9,7 @@ import { renderKeys } from "./js/pages/keys.js";
 import { renderLogs } from "./js/pages/logs.js";
 import { renderSettings } from "./js/pages/settings.js";
 import { renderIntegration } from "./js/pages/integration.js";
+import { renderFree } from "./js/pages/free.js";
 
 /*
   Client examples intentionally stay in modules: Harness, Continue, Open WebUI,
@@ -26,6 +27,7 @@ import { renderIntegration } from "./js/pages/integration.js";
 const state = { user: null, current: "overview", routeVersion: 0 };
 const pages = {
   overview: { title: "总览", render: renderOverview },
+  free: { title: "白嫖", render: renderFree },
   channels: { title: "渠道", render: renderChannels },
   models: { title: "模型", render: renderModels },
   logs: { title: "日志", render: renderLogs },
@@ -42,6 +44,7 @@ const icons = {
   logs: '<svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6zM9 11h6M9 15h6M9 7h3"/></svg>',
   settings: '<svg viewBox="0 0 24 24"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z"/><path d="m19 13 2 1-2 3-2-1a7 7 0 0 1-2 1l-.2 2.2h-3.6L11 17a7 7 0 0 1-2-1l-2 1-2-3 2-1a7 7 0 0 1 0-2L7 10 5 9l2-3 2 1a7 7 0 0 1 2-1l.2-2.2h3.6L15 6a7 7 0 0 1 2 1l2-1 2 3-2 1a7 7 0 0 1 0 2Z"/></svg>',
   integration: '<svg viewBox="0 0 24 24"><path d="M8 8h8v8H8zM4 12h4M16 12h4M12 4v4M12 16v4"/></svg>',
+  free: '<svg viewBox="0 0 24 24"><path d="M12 2l2.4 5.2L20 8l-4 3.9.9 5.6L12 14.9 7.1 17.5 8 11.9 4 8l5.6-.8z"/></svg>',
 };
 
 function buildNav() {
