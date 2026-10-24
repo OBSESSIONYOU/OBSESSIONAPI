@@ -1,0 +1,4 @@
+title = "Privacy Guard - default credential rules"
+
+[extend]
+useDefault = true

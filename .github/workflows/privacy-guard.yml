@@ -1,0 +1,25 @@
+name: Privacy Guard
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  privacy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install checksum-verified scanner and local hooks
+        run: python scripts/privacy_guard.py install
+      - name: Test actual commit and push blocking
+        run: python -m unittest discover -s scripts -p test_privacy_guard.py
+      - name: Check all reachable commits and file paths
+        run: python scripts/privacy_guard.py ci
