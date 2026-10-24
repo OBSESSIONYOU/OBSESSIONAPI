@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 运行时数据（含数据库与密钥，绝不能上传）
+data/
+*.db
+*.db-wal
+*.db-shm
+*.secret
+
+# 本地环境与密钥
+.env
+.env.*
+!.env.example
+python-env.txt
+
+# 备份与临时文件
+backups/
+backup-*/
+*.log
+*.patch
+.workbuddy-ai/
+.dsh-project-memory/
+
+# 截图与杂物（README 未引用的）
+dashboard.png
+settings.png
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

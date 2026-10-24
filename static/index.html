@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>OBSESSIONAPI · 控制台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><path d='M50 8 88 30v40L50 92 12 70V30z' fill='%232783DE'/><path d='m50 23 23 13v28L50 77 27 64V36z' fill='%23fff'/></svg>">
+<link rel="preload" as="font" type="font/woff2" href="/static/fonts/ibm-plex-sans-400.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/static/fonts/ibm-plex-sans-600.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/static/fonts/ibm-plex-mono-400.woff2" crossorigin>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main-content">跳到主要内容</a>
+
+<section id="login-view" class="auth-view hidden" aria-labelledby="login-title">
+  <div class="auth-card">
+    <div class="brand brand-auth">
+      <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 40 40" role="img"><path d="M20 2 36 11v18L20 38 4 29V11z" fill="currentColor"/><path d="m20 9 9 5v12l-9 5-9-5V14z" fill="var(--panel)"/></svg></span>
+      <span><strong>OBSESSIONAPI</strong><small>个人 API 网关</small></span>
+    </div>
+    <p class="auth-kicker">本地控制台</p>
+    <h1 id="login-title">欢迎回来</h1>
+    <p class="auth-copy">查看网关状态，定位上游异常。</p>
+    <form id="login-form" novalidate>
+      <div class="form-row"><label for="login-user">用户名</label><input id="login-user" autocomplete="username" required></div>
+      <div class="form-row"><label for="login-pass">密码</label><input id="login-pass" type="password" autocomplete="current-password" required></div>
+      <p class="form-error" id="login-err" role="alert"></p>
+      <button class="btn primary btn-wide" id="login-btn" type="submit">登录</button>
+    </form>
+    <form id="setup-form" class="hidden" novalidate>
+      <p class="auth-copy">首次使用：创建你的管理员账户。</p>
+      <div class="form-row"><label for="setup-user">管理员用户名</label><input id="setup-user" autocomplete="username" required></div>
+      <div class="form-row"><label for="setup-pass">密码（至少 12 位）</label><input id="setup-pass" type="password" autocomplete="new-password" required></div>
+      <p class="form-error" id="setup-err" role="alert"></p>
+      <button class="btn primary btn-wide" id="setup-btn" type="submit">创建并进入控制台</button>
+    </form>
+  </div>
+</section>
+
+<div id="app-view" class="app hidden">
+  <header class="app-header">
+    <div class="brand header-brand">
+      <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 40 40" role="img"><path d="M20 2 36 11v18L20 38 4 29V11z" fill="currentColor"/><path d="m20 9 9 5v12l-9 5-9-5V14z" fill="var(--panel)"/></svg></span>
+      <span><strong>OBSESSIONAPI</strong><small>API Gateway</small></span>
+    </div>
+    <button class="menu-toggle" id="menu-toggle" type="button" aria-label="打开导航" aria-expanded="false">☰</button>
+    <nav id="nav" aria-label="主导航"></nav>
+    <div class="header-actions">
+      <label class="theme-control" for="theme-select"><span>主题</span><select id="theme-select"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label>
+      <span class="account-chip" id="who"></span>
+      <button class="logout-btn" id="logout-btn" type="button">退出</button>
+    </div>
+  </header>
+  <div id="nav-scrim" class="nav-scrim hidden"></div>
+  <main id="main-content" class="main">
+    <header class="topbar">
+      <nav class="breadcrumb" aria-label="当前位置"><span>工作空间</span><span aria-hidden="true">/</span><strong id="breadcrumb-current">总览</strong></nav>
+    </header>
+    <div id="content" class="content"></div>
+  </main>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root" role="status" aria-live="polite" aria-atomic="true"></div>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

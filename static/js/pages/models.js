@@ -1,0 +1,37 @@
+import { api } from "../core/api.js";
+import { $, esc, fmtNum } from "../core/dom.js";
+import { badge, confirmModal, statusBadge, toast } from "../core/ui.js";
+import { pageHeader } from "../core/page.js";
+
+const availabilityLabel = { available: "可用", cooling: "冷却中", disabled: "已停用" };
+const bindingMarkup = (model) => {
+  const bindings = model.bindings || [];
+  return bindings.length ? bindings.map((binding) => `<div class="subtle mono">${esc(binding.channel_name)} → ${esc(binding.upstream_model)} · ${availabilityLabel[binding.availability] || "未知"}</div>`).join("") : `<span class="subtle">未绑定渠道</span>`;
+};
+
+export async function renderModels(el, { navigate, isCurrent } = {}) {
+  const refresh = () => renderModels(el, { navigate, isCurrent });
+  const [models, channels] = await Promise.all([api("/models"), api("/channels")]);
+  if (isCurrent && !isCurrent()) return;
+  const channelCounts = Object.fromEntries(models.map((model) => [model.model_name, 0]));
+  models.forEach((model) => { channelCounts[model.model_name] = Number(model.available_channel_count || 0); });
+  el.innerHTML = `<div class="content-inner">${pageHeader("模型", "管理公开模型与渠道绑定", `<button class="btn" id="model-import" type="button">从渠道导入</button><button class="btn primary" id="model-add" type="button">新增模型</button>`)}<div class="toolbar"><input id="model-search" placeholder="搜索模型 ID、显示名或厂商" aria-label="搜索模型"><span class="spacer"></span><button class="btn sm" id="model-batch-on" type="button">批量上架</button><button class="btn sm" id="model-batch-off" type="button">批量下架</button><button class="btn sm" id="model-view" type="button">切换卡片视图</button></div><div class="card" id="model-container"></div></div>`;
+  const container = $("#model-container"); let cardView = false;
+  const draw = () => { const keyword = $("#model-search").value.trim().toLowerCase(); const filtered = models.filter((model) => [model.model_name, model.display_name, model.vendor].join(" ").toLowerCase().includes(keyword)); const selected = (model) => `<input class="checkbox" type="checkbox" data-model-select="${model.id}" aria-label="选择 ${esc(model.model_name)}">`; if (cardView) container.innerHTML = `<div class="grid model-grid">${filtered.length ? filtered.map((model) => `<article class="model-card"><div class="toolbar"><input class="checkbox" type="checkbox" data-model-select="${model.id}" aria-label="选择 ${esc(model.model_name)}"><span class="spacer">${statusBadge(model.status)}</span></div><h3 class="mono">${esc(model.model_name)}</h3><p>${esc(model.display_name || "未设置显示名")}</p><p>${esc(model.vendor || "未设置厂商")} · ${channelCounts[model.model_name] || 0}/${Number(model.channel_count || 0)} 个可用渠道</p><div class="mt-16">${bindingMarkup(model)}</div><div class="toolbar mt-16"><button class="btn sm" data-model-edit="${model.id}" type="button">编辑</button><button class="btn sm" data-model-toggle="${model.id}" type="button">${model.status ? "下架" : "上架"}</button></div></article>`).join("") : `<div style="grid-column:1/-1">${emptyModel(keyword)}</div>`}</div>`; else container.innerHTML = `<div class="table-wrap"><table class="data-table"><thead><tr><th></th><th>公开模型</th><th>显示名</th><th>厂商</th><th>绑定渠道 / 上游</th><th>可用渠道</th><th>状态</th><th style="text-align:right">操作</th></tr></thead><tbody>${filtered.length ? filtered.map((model) => `<tr><td>${selected(model)}</td><td class="mono">${esc(model.model_name)}</td><td>${esc(model.display_name || "—")}</td><td>${esc(model.vendor || "—")}</td><td>${bindingMarkup(model)}</td><td>${channelCounts[model.model_name] ? badge(`${channelCounts[model.model_name]}/${Number(model.channel_count || 0)} 个渠道`, "info") : badge(model.channel_count ? `0/${model.channel_count} 个渠道可用` : "无绑定渠道", "danger")}</td><td>${statusBadge(model.status)}</td><td><div class="table-actions"><button class="btn sm" data-model-edit="${model.id}" type="button">编辑</button><button class="btn sm" data-model-toggle="${model.id}" type="button">${model.status ? "下架" : "上架"}</button></div></td></tr>`).join("") : `<tr><td colspan="8" style="padding:0">${emptyModel(keyword)}</td></tr>`}</tbody></table></div>`; bind(); };
+  const emptyModel = (keyword) => `<div class="empty-state"><strong>${keyword ? "没有匹配的模型" : "还没有模型"}</strong><p>${keyword ? "换个关键词试试。" : "从渠道导入或手动创建一个公开模型。"}</p></div>`;
+  const bind = () => { container.querySelectorAll("[data-model-toggle]").forEach((button) => { button.onclick = async () => { const model = models.find((item) => item.id === Number(button.dataset.modelToggle)); try { await api(`/models/${model.id}`, { method: "PUT", body: JSON.stringify({ status: model.status ? 0 : 1 }) }); model.status = model.status ? 0 : 1; toast("模型状态已更新"); draw(); } catch (error) { toast(error, "error"); } }; }); container.querySelectorAll("[data-model-edit]").forEach((button) => { button.onclick = () => modelForm(models.find((item) => item.id === Number(button.dataset.modelEdit)), refresh); }); };
+  const selectedModels = () => [...container.querySelectorAll("[data-model-select]:checked")].map((input) => models.find((model) => model.id === Number(input.dataset.modelSelect))).filter(Boolean);
+  const batch = (status) => { const chosen = selectedModels(); if (!chosen.length) return toast("请先选择模型", "err"); Promise.all(chosen.map((model) => api(`/models/${model.id}`, { method: "PUT", body: JSON.stringify({ status }) }))).then(() => { chosen.forEach((model) => { model.status = status; }); toast("批量操作完成"); draw(); }).catch((error) => toast(error.message, "err")); };
+  $("#model-search").oninput = draw; $("#model-view").onclick = () => { cardView = !cardView; $("#model-view").textContent = cardView ? "切换表格视图" : "切换卡片视图"; draw(); }; $("#model-batch-on").onclick = () => batch(1); $("#model-batch-off").onclick = () => batch(0); $("#model-add").onclick = () => modelForm(null, refresh); $("#model-import").onclick = async () => { const discovered = [...new Set(channels.flatMap((channel) => String(channel.models || "").split(",").map((name) => name.trim()).filter(Boolean)))]; const existing = new Set(models.map((model) => model.model_name)); const missing = discovered.filter((name) => !existing.has(name)); if (!missing.length) return toast("没有新的渠道模型"); try { for (const name of missing) await api("/models", { method: "POST", body: JSON.stringify({ model_name: name, display_name: name, vendor: "", status: 1 }) }); toast(`已导入 ${missing.length} 个模型`); refresh(); } catch (error) { toast(error, "error"); } };
+  draw();
+  void navigate;
+}
+
+function modelForm(model, done) {
+  openModelForm(model, done);
+}
+
+function openModelForm(model, done) {
+  const body = `<div class="form-row"><label for="model-name">公开模型 ID</label><input id="model-name" class="mono" autofocus value="${esc(model?.model_name || "")}" ${model ? "readonly" : ""}></div><div class="form-row"><label for="model-display">显示名</label><input id="model-display" value="${esc(model?.display_name || "")}"></div><div class="form-row"><label for="model-vendor">厂商</label><input id="model-vendor" value="${esc(model?.vendor || "")}"></div>`;
+  import("../core/ui.js").then(({ openModal }) => openModal(model ? "编辑模型" : "新增模型", body, async () => { const payload = { display_name: $("#model-display").value.trim(), vendor: $("#model-vendor").value.trim() }; if (model) await api(`/models/${model.id}`, { method: "PUT", body: JSON.stringify(payload) }); else await api("/models", { method: "POST", body: JSON.stringify({ ...payload, model_name: $("#model-name").value.trim(), status: 1 }) }); toast("模型已保存"); done(); }, "保存"));
+}
