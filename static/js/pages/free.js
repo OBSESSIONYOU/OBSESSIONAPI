@@ -24,7 +24,7 @@ export async function renderFree(el, { navigate, initialFilters = {}, isCurrent 
   el.querySelectorAll("[data-tab]").forEach((button) => { button.onclick = () => renderFree(el, { navigate, initialFilters: { tab: button.dataset.tab }, isCurrent }); });
   const body = $("#free-body");
   if (active === "channels") { await renderChannels(body, { navigate, isCurrent }); return; }
-  if (active === "access") { await renderAccess(body, refresh); return; }
+  if (active === "access") { body.innerHTML = '<div class="card"><p class="subtle">账号反代已独立为「接入反代」页，请从左侧导航进入。</p></div>'; return; }
   if (active === "eac") { await renderEac(body, refresh); return; }
   await renderFreeModels(body, refresh);
 }

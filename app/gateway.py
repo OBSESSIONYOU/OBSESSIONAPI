@@ -726,7 +726,7 @@ def header_names(headers: dict[str, str]) -> list[str]:
     return sorted({str(name).lower() for name in (headers or {})})
 
 
-ALLOWED_CHANNEL_TYPES = {"openai", "openai_chat", "anthropic", "openai_responses", "gemini", "mock", "auto", "opencode_free", "lobsterai"}
+ALLOWED_CHANNEL_TYPES = {"openai", "openai_chat", "anthropic", "openai_responses", "gemini", "mock", "auto", "opencode_free", "lobsterai", "access_gemini", "access_minimax", "access_cline"}
 
 
 def validate_channel_type(value: str) -> str:

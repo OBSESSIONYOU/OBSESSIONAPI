@@ -648,6 +648,12 @@ def _channel_base_url(channel_type: str, value: str) -> str:
         return "https://opencode.ai"
     if channel_type == "lobsterai":
         return "https://lobsterai-server.youdao.com"
+    if channel_type == "access_gemini":
+        return "https://daily-cloudcode-pa.googleapis.com"
+    if channel_type == "access_minimax":
+        return "https://agent.minimax.cn"
+    if channel_type == "access_cline":
+        return "https://api.cline.bot"
     try:
         if channel_type == "anthropic":
             return normalize_anthropic_base_url(value)
