@@ -1,5 +1,6 @@
 """本轮优化的回归契约：熔断持久化/自动禁用恢复、Key 权限限流、渠道代理、响应缓存与分位统计。"""
 import asyncio
+from contextlib import closing
 import tempfile
 import time
 import unittest
@@ -38,6 +39,37 @@ class OptimizationTests(unittest.TestCase):
         return client.post("/api/keys", headers=headers, json={
             "name": "client", "user_id": user_id, **extra,
         }).json()["key"]
+
+    def test_gateway_storage_size_includes_active_database_and_wal(self):
+        with TestClient(app) as client:
+            headers, _ = self._admin(client)
+            with closing(database.get_db()) as conn:
+                conn.execute("CREATE TABLE size_probe (payload BLOB)")
+                conn.execute("INSERT INTO size_probe VALUES (zeroblob(1048576))")
+                conn.commit()
+                main_bytes = database.DB_PATH.stat().st_size
+                wal_bytes = Path(str(database.DB_PATH) + "-wal").stat().st_size
+                self.assertGreater(wal_bytes, 1048576)
+                response = client.get("/api/gateway", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["db_size_mb"], round((main_bytes + wal_bytes) / 1048576, 2))
+
+    def test_gateway_storage_size_tolerates_disappearing_wal(self):
+        with TestClient(app) as client:
+            headers, _ = self._admin(client)
+            main_bytes = database.DB_PATH.stat().st_size
+            wal_path = Path(str(database.DB_PATH) + "-wal")
+            original_stat = Path.stat
+
+            def stat_with_missing_wal(path, *args, **kwargs):
+                if path == wal_path:
+                    raise FileNotFoundError("WAL was checkpointed before metadata could be read")
+                return original_stat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", stat_with_missing_wal):
+                response = client.get("/api/gateway", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["db_size_mb"], round(main_bytes / 1048576, 2))
 
     # ---------------------------------------------------------- 熔断持久化
     def test_breaker_state_survives_process_restart(self):

@@ -11,7 +11,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .database import DB_PATH, create_initial_admin, execute, iso, maintenance, new_api_key, new_token, query, query_one, hash_password, verify_password, utcnow
+from .database import create_initial_admin, execute, iso, maintenance, new_api_key, new_token, query, query_one, hash_password, verify_password, utcnow
 from .gateway import (
     _anthropic_error_message,
     _anthropic_to_openai,
@@ -37,7 +37,7 @@ from .gateway import (
     upstream_model_for_channel,
     validate_channel_type,
 )
-from . import settings_store
+from . import database, settings_store
 from .secrets import encrypt_secret
 from .protocols import (
     channel_protocol,
@@ -1974,14 +1974,20 @@ async def gateway_info(request: Request):
     require_admin(request)
     import platform
     import sys
-    _wal = DB_PATH.with_name(DB_PATH.stem + "-wal")
-    _db_size = DB_PATH.stat().st_size + (_wal.stat().st_size if _wal.exists() else 0)
+    db_path = database.DB_PATH
+    db_size = 0
+    for path in (db_path, db_path.with_name(db_path.name + "-wal")):
+        try:
+            db_size += path.stat().st_size
+        except FileNotFoundError:
+            # SQLite can checkpoint and remove the WAL while its size is sampled.
+            pass
     channels = query("SELECT id,name,type,status FROM channels ORDER BY id")
     return {
         "version": "v1.0.0",
         "python": sys.version.split()[0],
         "platform": platform.platform(),
-        "db_size_mb": round(_db_size / 1048576, 2) if DB_PATH.exists() else 0,
+        "db_size_mb": round(db_size / 1048576, 2),
         "endpoints": [
             {"method": "GET", "path": "/v1/models", "desc": "列出网关可用模型"},
             {"method": "POST", "path": "/v1/chat/completions", "desc": "Chat Completions（支持 stream）"},
