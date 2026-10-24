@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from . import database
 from .admin_api import router as admin_router
 from .lobsterai_admin import router as lobsterai_router
+from .account_channels import router as account_channels_router
 from .gateway import (auto_recover_loop, external_router, is_channel_auto_disabled,
                       is_channel_cooling, load_breaker_state, router as gateway_router)
 from .settings_store import clear_cache, get
@@ -31,6 +32,7 @@ app.include_router(gateway_router)
 app.include_router(external_router)
 app.include_router(admin_router)
 app.include_router(lobsterai_router)
+app.include_router(account_channels_router)
 
 STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

@@ -1,7 +1,7 @@
 import { api } from "../core/api.js";
 import { $, esc, fmtDuration, fmtNum, fmtRate, qs } from "../core/dom.js";
 import { drawCombo, bindTooltip, observeCanvas } from "../core/charts.js";
-import { badge, copyText, emptyState } from "../core/ui.js";
+import { badge, copyText, emptyState, toast } from "../core/ui.js";
 import { cardHeading, pageHeader, statusStrip } from "../core/page.js";
 
 const statusLabel = { normal: "正常", warning: "需要关注", error: "异常", cooling: "冷却中", disabled: "已自动禁用" };
@@ -14,10 +14,36 @@ export async function renderOverview(el, { navigate, initialFilters = {}, isCurr
   const refresh = () => renderOverview(el, { navigate, initialFilters: { range }, isCurrent });
   el._pageCleanup?.(); el._pageCleanup = null;
   el.innerHTML = `<div class="content-inner"><div id="overview-root">${pageHeader("总览", "网关运行状态与请求概览 · 最近更新 " + updatedAt, `<select id="overview-range" class="range-select" aria-label="统计范围"><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option></select><button class="btn" id="overview-refresh" type="button">刷新</button>`)}</div><div class="empty-state"><span class="skeleton" style="display:inline-block;width:180px"></span></div></div>`;
+  // 账号反代卡片渲染
+  const accGrid = $("#account-channels-grid");
+  if (accGrid) {
+    const cards = accountChannels.cards || [];
+    accGrid.innerHTML = cards.length ? cards.map((c) => `
+      <article class="card stat-card" style="min-width:0">
+        <div class="toolbar"><strong>${esc(c.name)}</strong><span class="spacer"></span>${badge(c.connected ? (c.enabled ? "已接入" : "已停用") : "未接入", c.connected ? (c.enabled ? "success" : "warning") : "")}</div>
+        <p class="subtle" style="margin:6px 0">${esc(c.desc || "")}</p>
+        <p class="subtle">${esc(c.vendor || "")} · 账号 ${c.accounts} · 模型 ${c.models}</p>
+        <div class="toolbar mt-16">
+          ${c.login === "oauth" && c.channels.length ? `<button class="btn sm" data-lb-relogin="${c.channels[0].id}" type="button">重新登录</button>` : ""}
+          <span class="spacer"></span>
+          <button class="btn sm" data-acc-goto type="button">管理</button>
+        </div>
+      </article>`).join("") : `<div class="empty-state" style="grid-column:1/-1"><strong>还没有账号反代渠道</strong><p>到「渠道」页添加 OpenCode 免费或 LobsterAI 渠道后，这里会显示接入状态。</p></div>`;
+    accGrid.querySelectorAll("[data-acc-goto]").forEach((b) => { b.onclick = () => navigate("channels"); });
+    accGrid.querySelectorAll("[data-lb-relogin]").forEach((b) => {
+      b.onclick = async () => {
+        try {
+          const start = await api("/channels/lobsterai/login/start", { method: "POST", body: JSON.stringify({ channel_id: Number(b.dataset.lbRelogin) }) });
+          window.open(start.login_url, "_blank");
+          toast("已打开登录页，等待授权…");
+        } catch (e) { toast(`发起登录失败：${e.message}`, "err"); }
+      };
+    });
+  }
   $("#overview-range").value = range;
   $("#overview-range").onchange = (event) => navigate("overview", { range: event.target.value });
   $("#overview-refresh").onclick = refresh;
-  const [dashboard, gateway] = await Promise.all([api(`/dashboard?${qs({ range })}`), api("/gateway")]);
+  const [dashboard, gateway, accountChannels] = await Promise.all([api(`/dashboard?${qs({ range })}`), api("/gateway"), api("/account-channels").catch(() => ({ cards: [] }))]);
   if (isCurrent && !isCurrent()) return;
   const metrics = dashboard.metrics || {};
   const strip = dashboard.status_strip || {};
@@ -32,8 +58,13 @@ export async function renderOverview(el, { navigate, initialFilters = {}, isCurr
       { label: "启用渠道", value: `${strip.active_channels || 0}/${strip.total_channels || 0}`, type: "success" },
       { label: "冷却渠道", value: strip.cooling_channels || 0, type: strip.cooling_channels ? "warning" : "normal" },
       ...(autoDisabled ? [{ label: "自动禁用", value: autoDisabled, type: "danger" }] : []),
+      ...(accountChannels.cards?.length ? [{ label: "账号反代", value: accountChannels.cards.filter((c) => c.connected).length + "/" + accountChannels.cards.length, type: accountChannels.cards.some((c) => c.connected && c.enabled) ? "success" : "normal" }] : []),
       { label: "上架模型", value: strip.published_models || 0, type: "success" },
     ])}
+    <section class="card mt-16" id="account-channels-panel">
+      <div class="card-heading"><h2>账号反代 · 白嫖渠道</h2><span class="subtle">登录一次，免费额度直接进网关</span></div>
+      <div class="grid three-col" id="account-channels-grid"></div>
+    </section>
     <div class="grid metrics-grid">
       <article class="card stat-card"><span class="stat-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 19h16M6.5 15l3.5-3.5 2.5 2L18 7"/></svg></span><span class="stat-label">今日客户端请求</span><strong class="stat-value">${fmtNum(metrics.today_requests)}</strong><span class="stat-foot">上游尝试 ${fmtNum(metrics.today_attempts)} · 重试 ${fmtNum(metrics.today_retries)} · 按 UTC 日期统计</span></article>
       <article class="card stat-card"><span class="stat-icon ${metrics.success_rate !== null && metrics.success_rate < 90 ? "warning" : "success"}" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M20 6.5 9.5 17.5 4 12"/></svg></span><span class="stat-label">成功率</span><strong class="stat-value">${fmtRate(metrics.success_rate)}</strong><span class="stat-foot ${metrics.success_rate !== null && metrics.success_rate < 90 ? "warning" : ""}">${metrics.success_rate !== null && metrics.success_rate < 90 ? "需要关注" : "当前请求结果"}</span></article>

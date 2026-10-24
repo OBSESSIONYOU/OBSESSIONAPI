@@ -104,7 +104,7 @@ function channelForm(channel, done) {
   const dialog = openModal(channel ? "编辑渠道" : "新增渠道", `
     <div class="form-grid"><div class="form-row"><label for="f-name">渠道名称</label><input id="f-name" autofocus value="${esc(channel?.name || "")}"></div><div class="form-row"><label for="f-type">协议</label><select id="f-type"><option value="auto">自动识别</option><option value="openai_chat">OpenAI Chat</option><option value="openai_responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages</option><option value="gemini">Gemini</option><option value="mock">本地 mock</option><option value="opencode_free">OpenCode 免费</option><option value="lobsterai">LobsterAI (有道账号)</option></select></div></div>
     <div class="form-row" id="f-url-row"><label for="f-url">Base URL</label><input id="f-url" class="mono" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" value="${esc(channel?.base_url || "")}" placeholder="上游兼容 API 的根地址"><span class="form-help" id="f-url-hint">填写地址后可自动识别协议和模型。</span></div>
-    <div class="form-row" id="f-key-row"><label for="f-key">上游 API Key</label><div class="key-value"><input id="f-key" type="password" autocomplete="new-password" placeholder="留空表示保持现有密钥不变"><button class="btn sm" id="f-key-toggle" type="button">显示</button><button class="btn sm" id="f-key-copy" type="button">复制当前输入</button><button class="btn sm hidden" id="f-lb-login" type="button">登录有道账号</button></div><span class="form-help">编辑时不会回填数据库中的密钥；输入为空时不会假装复制成功。</span></div>
+    <div class="form-row" id="f-key-row"><label for="f-key">上游 API Key</label><div class="key-value"><input id="f-key" type="password" autocomplete="new-password" placeholder="留空表示保持现有密钥不变"><button class="btn sm" id="f-key-toggle" type="button">显示</button><button class="btn sm" id="f-key-copy" type="button">复制当前输入</button></div><span class="form-help">编辑时不会回填数据库中的密钥；输入为空时不会假装复制成功。</span></div>
     <div class="form-grid"><div class="form-row"><label for="f-models">第三方软件使用的公开模型名</label><input id="f-models" class="mono" value="${esc(channel?.models || "")}" placeholder="例如：glm-5.3,deepseek-v4"></div><div class="form-row"><label for="f-policy">工具调用策略</label><select id="f-policy"><option value="preserve">保留工具调用</option><option value="strip">仅文本兼容</option></select></div></div>
     <div class="form-grid"><div class="form-row"><label for="f-priority">优先级</label><input id="f-priority" type="number" value="${esc(channel?.priority ?? 0)}"></div><div class="form-row"><label for="f-weight">权重</label><input id="f-weight" type="number" min="1" value="${esc(channel?.weight ?? 1)}"></div></div>
     <details class="mt-16"><summary>高级设置：网络与代理</summary><div class="form-row"><label for="f-proxy">渠道代理地址</label><input id="f-proxy" class="mono" placeholder="${channel ? "留空表示保持现有代理不变" : "例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"}"><span class="form-help">${channel?.proxy_url ? `当前：${esc(channel.proxy_url)}（编辑时不回填）` : "支持 http/https/socks5；留空表示直连。"}</span></div>${channel?.proxy_url ? `<label class="switch-row"><span>清除现有代理<span class="form-help">勾选后保存即改为直连。</span></span><input class="checkbox" id="f-proxy-clear" type="checkbox"></label>` : ""}<div class="form-grid"><div class="form-row"><label for="f-connect">连接超时覆盖（秒）</label><input id="f-connect" type="number" min="0" value="${esc(channel?.connect_timeout_s ?? "")}" placeholder="留空沿用全局"></div><div class="form-row"><label for="f-read">读取超时覆盖（秒）</label><input id="f-read" type="number" min="0" value="${esc(channel?.read_timeout_s ?? "")}" placeholder="留空沿用全局"></div></div><div class="form-row"><label for="f-concurrency">最大并发连接数</label><input id="f-concurrency" type="number" min="0" value="${esc(channel?.max_concurrency ?? 0)}"><span class="form-help">0 表示不限制；用于限制上游连接池。</span></div><div class="form-row"><label for="f-rpm">渠道速率上限（次/分）</label><input id="f-rpm" type="number" min="0" value="${esc(channel?.rpm_limit ?? 0)}"><span class="form-help">0 表示不限制；达到上限的渠道会被自动跳过，用于保护上游不被封禁。</span></div></details>
@@ -123,30 +123,8 @@ function channelForm(channel, done) {
     try { if (channel) await api(`/channels/${channel.id}`, { method: "PUT", body: JSON.stringify(payload) }); else await api("/channels", { method: "POST", body: JSON.stringify(payload) }); toast(channel ? "渠道已保存" : "渠道已创建", "success"); done(); } catch (error) { $("#f-save-status", dialog).textContent = error.message || "保存失败"; throw error; }
   }, "保存");
   dialog.addEventListener("close", () => controller?.abort(), { once: true }); $("#f-type", dialog).value = channel?.type || "auto"; $("#f-policy", dialog).value = channel?.tool_policy || "preserve";
-  const syncProtocolFields = () => { const type = $("#f-type", dialog).value; const mock = type === "mock"; $("#f-url-row", dialog).classList.toggle("hidden", mock); $("#f-key-row", dialog).classList.toggle("hidden", mock); $("#f-lb-login", dialog)?.classList.toggle("hidden", $("#f-type", dialog).value !== "lobsterai"); $("#f-preview", dialog).disabled = mock; $("#f-discover", dialog).disabled = mock; $("#f-url-hint", dialog).textContent = mock ? "本地 mock 不会访问网络。" : type === "anthropic" ? "Anthropic Messages 根地址，例如 https://api.example.com。" : type === "gemini" ? "Gemini API 根地址，例如 https://generativelanguage.googleapis.com。" : "填写地址后可自动识别协议和模型；自定义路径前缀会保留。"; };
+  const syncProtocolFields = () => { const type = $("#f-type", dialog).value; const mock = type === "mock"; $("#f-url-row", dialog).classList.toggle("hidden", mock); $("#f-key-row", dialog).classList.toggle("hidden", mock); $("#f-preview", dialog).disabled = mock; $("#f-discover", dialog).disabled = mock; $("#f-url-hint", dialog).textContent = mock ? "本地 mock 不会访问网络。" : type === "anthropic" ? "Anthropic Messages 根地址，例如 https://api.example.com。" : type === "gemini" ? "Gemini API 根地址，例如 https://generativelanguage.googleapis.com。" : "填写地址后可自动识别协议和模型；自定义路径前缀会保留。"; };
   $("#f-type", dialog).onchange = syncProtocolFields; syncProtocolFields(); $("#f-name", dialog).oninput = () => { if (!applyingSuggestion) channelNameEditedByUser = true; };
-  // LobsterAI 账号登录：协议选择 lobsterai 时展示登录按钮（先保存渠道拿到 id，再走 OAuth）
-  const lbLogin = $("#f-lb-login", dialog);
-  if (lbLogin) lbLogin.onclick = async () => {
-    const channelId = channel?.id;
-    if (!channelId) return toast("请先保存渠道，再点击登录", "info");
-    lbLogin.disabled = true; lbLogin.textContent = "正在发起登录…";
-    try {
-      const start = await api("/channels/lobsterai/login/start", { method: "POST", body: JSON.stringify({ channel_id: channelId }) });
-      window.open(start.login_url, "_blank");
-      lbLogin.textContent = "等待浏览器完成授权…";
-      const deadline = Date.now() + 600000;
-      for (;;) {
-        await new Promise((r) => setTimeout(r, 2000));
-        const poll = await api(`/channels/lobsterai/login/poll?state=${encodeURIComponent(start.state)}`);
-        if (poll.status === "done") { toast(`登录成功：${poll.nickname || "已绑定账号"}`, "success"); break; }
-        if (poll.status === "error") { toast(`登录失败：${poll.error || "未知错误"}`, "err"); break; }
-        if (Date.now() > deadline) { toast("登录超时", "err"); break; }
-      }
-    } catch (error) { toast(`登录发起失败：${error.message}`, "err"); }
-    finally { lbLogin.disabled = false; lbLogin.textContent = "登录有道账号"; }
-  };
-
   // 新增渠道时清掉浏览器自动填充进 URL/Key 框的残留值，保持留白
   if (!channel) { for (const id of ["#f-url", "#f-key"]) { const input = $(id, dialog); if (input && input.value && input.value !== input.defaultValue) { input.value = ""; } } setTimeout(() => { for (const id of ["#f-url", "#f-key"]) { const input = $(id, dialog); if (input && !input.value && input.dataset.keepAutofill !== "1") input.value = ""; } }, 120); }
   $("#f-key-toggle", dialog).onclick = () => { const input = $("#f-key", dialog); input.type = input.type === "password" ? "text" : "password"; $("#f-key-toggle", dialog).textContent = input.type === "password" ? "显示" : "隐藏"; };
