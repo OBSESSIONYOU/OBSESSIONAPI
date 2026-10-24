@@ -100,6 +100,54 @@ class OptimizationTests(unittest.TestCase):
             recovered = gateway._auto_recover_once()
         self.assertEqual(recovered, 1)
         self.assertFalse(gateway.is_channel_auto_disabled(channel_id))
+        # v1.1 半愈合：到点恢复不再满血——欠账减半、进入观察期，要一次真实成功才彻底清零
+        state = gateway.channel_breaker_state(channel_id)
+        self.assertTrue(state["probation"], state)
+        gateway._breaker_mark(channel_id, True, real_completion=False)  # 再来一次探测成功仍是半愈合
+        self.assertTrue(gateway.channel_breaker_state(channel_id)["probation"])
+        gateway._breaker_mark(channel_id, True, real_completion=True)   # 真实对话成功才彻底恢复
+        self.assertFalse(gateway.channel_breaker_state(channel_id)["probation"])
+
+    def test_graded_cooldown_by_error_category(self):
+        """分级冷却：auth 类用满额 cooldown_seconds，瞬时故障走 5s 指数退避，429 听 Retry-After。"""
+        database.init_db()
+        database.execute("INSERT INTO channels(name,type,models,created_at) VALUES(?,?,?,?)",
+                         ("c1", "mock", "model-a", database.iso(database.utcnow())))
+        channel_id = database.query_one("SELECT id FROM channels")["id"]
+        with mock.patch.object(gateway.settings_store, "get_all",
+                               return_value={**gateway.settings_store.DEFAULTS,
+                                             "fail_threshold": 1, "cooldown_seconds": 300}):
+            gateway._breaker_mark(channel_id, False, reason="auth")
+            self.assertEqual(gateway._BREAKER[channel_id]["last_cooldown_seconds"], 300)
+            gateway._breaker_mark(channel_id, True)
+            gateway._breaker_mark(channel_id, False, reason="upstream_5xx")
+            self.assertEqual(gateway._BREAKER[channel_id]["last_cooldown_seconds"], 5)
+            gateway._breaker_mark(channel_id, True)
+            gateway._breaker_mark(channel_id, False, reason="rate_limit", retry_after_ms=45000)
+            self.assertEqual(gateway._BREAKER[channel_id]["last_cooldown_seconds"], 45)
+            gateway._breaker_mark(channel_id, True)
+            gateway._breaker_mark(channel_id, False, reason="rate_limit")  # 无 Retry-After → 60s
+            self.assertEqual(gateway._BREAKER[channel_id]["last_cooldown_seconds"], 60)
+
+    def test_swrr_long_term_share_matches_weights(self):
+        """SWRR 平滑加权轮询：3:1 权重的两个渠道，长期份额精确等于 75%/25%。"""
+        database.init_db()
+        now = database.iso(database.utcnow())
+        database.execute("INSERT INTO channels(name,type,models,priority,weight,created_at) VALUES(?,?,?,?,?,?)",
+                         ("a", "mock", "model-a", 1, 3, now))
+        database.execute("INSERT INTO channels(name,type,models,priority,weight,created_at) VALUES(?,?,?,?,?,?)",
+                         ("b", "mock", "model-a", 1, 1, now))
+        gateway._SWRR_CUR.clear(); gateway._SWRR_HITS.clear()
+        gateway._SWRR_TOTAL = 0
+        picks = []
+        for _ in range(40):
+            ordered = gateway._candidates("model-a")
+            picks.append(ordered[0]["name"])
+        share_a = picks.count("a") / len(picks)
+        self.assertAlmostEqual(share_a, 0.75, delta=0.01)
+        stats = gateway.swrr_stats()
+        self.assertEqual(stats["total"], 40)
+        self.assertAlmostEqual(stats["channels"][str(gateway.query_one('SELECT id FROM channels WHERE name=?', ('a',))['id'])]["share_pct"], 75.0, delta=0.5)
 
     # ---------------------------------------------------------- Key 权限与限流
     def test_key_model_whitelist_blocks_other_models(self):

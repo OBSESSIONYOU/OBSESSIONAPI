@@ -1030,7 +1030,8 @@ def _auth_key(request: Request):
 
 def _breaker_default() -> dict:
     return {"streak": 0, "until": 0.0, "last_failure_count": 0, "cooldown_count": 0,
-            "auto_disabled": 0, "disabled_reason": "", "disabled_at": None, "disabled_at_ts": 0.0}
+            "auto_disabled": 0, "disabled_reason": "", "disabled_at": None, "disabled_at_ts": 0.0,
+            "probation": 0}
 
 
 def _parse_iso_ts(value) -> float:
@@ -1082,20 +1083,82 @@ def load_breaker_state() -> None:
             "disabled_reason": row["disabled_reason"] or "",
             "disabled_at": row["disabled_at"],
             "disabled_at_ts": _parse_iso_ts(row["disabled_at"]),
+            "probation": 0,
         }
 
 
-def _breaker_mark(channel_id: int, ok: bool, reason: str = "") -> None:
-    """记录一次渠道成败。连续失败达阈值进入冷却；反复冷却达 auto_disable_after 则自动禁用。"""
+# ---- 分级冷却（借鉴 zzcsapi）：不同错误需要不同耐心 ----
+# 凭证/配置类（auth、invalid_request、model_not_found、content_filter）：一分钟内绝不可能自愈，
+#   直接用配置的 cooldown_seconds（默认 300s），避免拿真流量反复撞墙；
+# 限流（rate_limit）：上游说"别急"——优先听 Retry-After，没有就 60s 起；
+# 瞬时故障（timeout / upstream_5xx / network 等）：指数退避 5s * 2^(n-1)，封顶 cooldown_seconds，
+#   偶发抖动不再被一刀切罚 5 分钟。
+_COOLDOWN_TRANSIENT_BASE_S = 5
+_COOLDOWN_RATE_LIMIT_S = 60
+_COOLDOWN_HARD_CATEGORIES = {"auth", "invalid_request", "model_not_found", "content_filter", "tool_not_supported", "protocol_error"}
+
+
+def _parse_retry_after_ms(headers) -> int:
+    """解析上游 Retry-After（RFC 9110：秒数或 HTTP 日期），返回毫秒；解析不出返回 0。"""
+    try:
+        raw = headers.get("retry-after") if hasattr(headers, "get") else None
+        if not raw:
+            return 0
+        text = str(raw).strip()
+        import re as _re
+        if _re.fullmatch(r"\d+(\.\d+)?", text):
+            return int(float(text) * 1000)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00")) if "T" in text or "-" in text else None
+        if parsed is not None:
+            return max(0, int(parsed.timestamp() * 1000 - time.time() * 1000))
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def _cooldown_seconds_for(streak: int, reason: str, retry_after_ms: int = 0) -> int:
+    """按错误分类决定这次冷却多久。Retry-After 优先（仅限流场景），全部钳制在 cooldown_seconds 内。"""
+    cap = max(1, int(_settings()["cooldown_seconds"]))
+    if reason == "rate_limit":
+        if retry_after_ms > 0:
+            return max(1, min(cap, retry_after_ms // 1000))
+        return max(1, min(cap, _COOLDOWN_RATE_LIMIT_S))
+    if reason in _COOLDOWN_HARD_CATEGORIES:
+        return cap
+    n = max(1, int(streak))
+    return max(1, min(cap, _COOLDOWN_TRANSIENT_BASE_S * (2 ** (n - 1))))
+
+
+def _breaker_mark(channel_id: int, ok: bool, reason: str = "", retry_after_ms: int = 0,
+                   real_completion: bool = True) -> None:
+    """记录一次渠道成败。连续失败达阈值进入分级冷却；反复冷却达 auto_disable_after 自动禁用。
+
+    real_completion=False 表示这次成功不是一次真实对话（如探测/列表拉取），只做半愈合：
+    失败计数减半、清冷却，但保留观察期标志——候选排序仍排在健康渠道之后，
+    直到一次真实成功才彻底清零（探测活着 ≠ 对话能用）。
+    """
     st = _BREAKER.get(channel_id) or _breaker_default()
     if ok:
-        st = _breaker_default()
+        if real_completion or not (st.get("streak") or st.get("cooldown_count") or st.get("probation")):
+            st = _breaker_default()  # 真实成功（或本来就没欠账）：彻底清零
+        else:
+            # 半愈合：解除自动禁用、清冷却给机会，失败计数减半进观察期；欠账还记着，
+            # 再失败会更快退避回去；last_error 类证据保留在日志里
+            st["until"] = 0.0
+            st["auto_disabled"] = 0
+            st["disabled_reason"] = ""
+            st["streak"] = max(1, int(st.get("streak", 1) or 1) // 2)
+            st["probation"] = 1
     else:
+        st["probation"] = 0
         st["streak"] = int(st.get("streak", 0) or 0) + 1
         st["last_failure_count"] = st["streak"]
         values = _settings()
         if st["streak"] >= int(values["fail_threshold"]):
-            st["until"] = time.time() + int(values["cooldown_seconds"])
+            seconds = _cooldown_seconds_for(st["streak"], reason, retry_after_ms)
+            st["until"] = time.time() + seconds
+            st["last_cooldown_reason"] = reason
+            st["last_cooldown_seconds"] = seconds
             st["streak"] = 0
             st["cooldown_count"] = int(st.get("cooldown_count", 0) or 0) + 1
             auto_after = int(values.get("auto_disable_after", 0) or 0)
@@ -1149,25 +1212,32 @@ def channel_breaker_state(channel_id: int) -> dict:
     return {
         "cooling": cooling,
         "auto_disabled": auto_disabled,
+        "probation": bool(st.get("probation") and not cooling and not auto_disabled),
         "disabled_reason": str(st.get("disabled_reason") or ""),
         "disabled_at": st.get("disabled_at"),
         "recover_in_s": recover_in,
         "consecutive_failures": int((st.get("last_failure_count") if (cooling or auto_disabled) else st.get("streak")) or 0),
         "cooldown_count": int(st.get("cooldown_count") or 0),
         "cooldown_remaining_s": max(0, int(until - time.time()) + 1) if cooling else 0,
+        "last_cooldown_reason": str(st.get("last_cooldown_reason") or ""),
     }
 
 
 def recover_channel(channel_id: int) -> None:
-    """人工或自动恢复：清空冷却与自动禁用状态。"""
+    """人工恢复：管理员明确操作，直接满血（清空冷却、禁用与观察期）。"""
     if channel_id in _BREAKER:
-        _breaker_mark(channel_id, True)
+        _breaker_mark(channel_id, True, real_completion=True)
         return
     execute("DELETE FROM channel_states WHERE channel_id=?", (channel_id,))
 
 
 def _auto_recover_once() -> int:
-    """把自动禁用已超过 auto_recover_seconds 的渠道恢复为正常，返回恢复数量。"""
+    """把自动禁用已超过 auto_recover_seconds 的渠道做半愈合恢复，返回恢复数量。
+
+    半愈合（借鉴 zzcsapi）：到点只解除禁用并清冷却，失败计数减半进入观察期（probation），
+    排序仍在健康渠道之后；要一次真实对话成功才彻底恢复。避免"key 已换/余额已充"的渠道
+    被钉死，也避免坏渠道 30 分钟一到就满血回链首再次打脸。
+    """
     values = _settings()
     seconds = int(values.get("auto_recover_seconds", 0) or 0)
     if not seconds:
@@ -1179,10 +1249,10 @@ def _auto_recover_once() -> int:
             continue
         disabled_ts = float(st.get("disabled_at_ts") or _parse_iso_ts(st.get("disabled_at")))
         if disabled_ts and now - disabled_ts >= seconds:
-            _breaker_mark(channel_id, True)
+            _breaker_mark(channel_id, True, real_completion=False)
             recovered += 1
     if recovered:
-        logger.info("自动恢复 %s 个渠道", recovered)
+        logger.info("自动半愈合恢复 %s 个渠道", recovered)
     return recovered
 
 
@@ -1383,16 +1453,67 @@ def _model_channels(model: str) -> list:
                  (model,))
 
 
+# ---- 平滑加权轮询（SWRR，nginx upstream 算法，借鉴 zzcsapi）----
+# 与加权随机相比：长期分流比例精确等于权重比（3:1 ⇒ 75%/25%），且不会突发连打同一家。
+# 观察期（probation，半愈合）渠道不进轮询池——可被兜底用，但不凭权重抢链首。
+_SWRR_CUR: dict[int, float] = {}
+_SWRR_HITS: dict[int, int] = {}
+_SWRR_TOTAL = 0
+
+
+def _swrr_pick_index(group: list) -> int:
+    """在同级优先级组内按平滑加权轮询选出链首，返回其下标；无可轮询成员返回 -1。"""
+    global _SWRR_TOTAL
+    pool_idx = [i for i, r in enumerate(group)
+                if int(r["weight"] or 1) > 0
+                and not _breaker_probation(r)
+                and not _breaker_unavailable(r)]
+    if not pool_idx:
+        return -1
+    total = 0.0
+    for i in pool_idx:
+        w = max(1, int(group[i]["weight"] or 1))
+        total += w
+        _SWRR_CUR[group[i]["id"]] = _SWRR_CUR.get(group[i]["id"], 0.0) + w
+    best = pool_idx[0]
+    for i in pool_idx:
+        if _SWRR_CUR.get(group[i]["id"], 0.0) > _SWRR_CUR.get(group[best]["id"], 0.0):
+            best = i
+    _SWRR_CUR[group[best]["id"]] = _SWRR_CUR.get(group[best]["id"], 0.0) - total
+    _SWRR_HITS[group[best]["id"]] = _SWRR_HITS.get(group[best]["id"], 0) + 1
+    _SWRR_TOTAL += 1
+    return best
+
+
+def swrr_stats() -> dict:
+    """各渠道加权轮询命中份额，供管理接口观测分流是否精确。"""
+    out = {str(cid): {"hits": n, "share_pct": round(n * 1000 / _SWRR_TOTAL) / 10}
+           for cid, n in _SWRR_HITS.items()} if _SWRR_TOTAL else {}
+    return {"total": _SWRR_TOTAL, "channels": out}
+
+
+def _breaker_probation(channel) -> bool:
+    """渠道处于半愈合观察期：可作为兜底候选，但排序排在健康渠道之后。"""
+    st = _BREAKER.get(channel["id"])
+    return bool(st and st.get("probation") and not st.get("auto_disabled")
+                and float(st.get("until", 0) or 0) <= time.time())
+
+
 def _candidates(model: str) -> list:
-    """按模型过滤启用渠道，组内按权重随机排序、组间按优先级从高到低，返回失败切换候选列表。"""
+    """按模型过滤启用渠道：组间按优先级从高到低，组内按 SWRR 平滑加权轮询排链首，
+    观察期（半愈合）渠道沉到各组末尾做兜底，返回失败切换候选列表。"""
     rows = _model_channels(model)
     if not rows:
         return []
     ordered = []
     for prio in sorted({r["priority"] for r in rows}, reverse=True):
         grp = [r for r in rows if r["priority"] == prio]
-        # 加权随机洗牌：weight 越大越可能排在前面
-        ordered.extend(sorted(grp, key=lambda r: random.random() ** (1.0 / max(r["weight"], 1)), reverse=True))
+        pick = _swrr_pick_index(grp)
+        if pick > 0:
+            grp = [grp[pick]] + grp[:pick] + grp[pick + 1:]
+        # 健康在前、观察期兜底；组内其余保持稳定顺序
+        grp.sort(key=lambda r: 1 if _breaker_probation(r) else 0)
+        ordered.extend(grp)
     alive = [r for r in ordered
              if not _breaker_unavailable(r)
              and not _channel_rate_exceeded(r["id"], _int_field(r, "rpm_limit"))]
@@ -1944,7 +2065,7 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
     attempt_diagnostic = ""
 
     def finalize(ch, pt, ct, status, code, err="", will_retry=False, breaker_failure=True,
-                 usage_source="unknown", result=None):
+                 usage_source="unknown", result=None, retry_after_ms=0):
         ip_p, op_p = _pricing(model)
         cost = ((pt if isinstance(pt, (int, float)) else 0) * ip_p +
                 (ct if isinstance(ct, (int, float)) else 0) * op_p) / 1_000_000
@@ -1968,7 +2089,8 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
             if result is not None and ch is not None:
                 _cache_store(model, body, ch["id"], result, pt, ct)
         elif breaker_failure:
-            _breaker_mark(ch["id"], False, reason=classify_upstream_error(code, err))
+            _breaker_mark(ch["id"], False, reason=classify_upstream_error(code, err),
+                          retry_after_ms=retry_after_ms)
 
     for attempt_index, ch in enumerate(candidates):
         if attempt_index:
@@ -2106,7 +2228,8 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                         resp.headers.get("content-type", ""),
                     )
                     will_retry = has_next_channel and _retry_allowed(resp.status_code, last_error)
-                    finalize(ch, 0, 0, "error", resp.status_code, last_error, will_retry)
+                    finalize(ch, 0, 0, "error", resp.status_code, last_error, will_retry,
+                             retry_after_ms=_parse_retry_after_ms(resp.headers))
                     if will_retry:
                         await _retry_pause(attempt_index)
                         continue
@@ -2140,6 +2263,7 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                 continue
             if resp.status_code != 200:
                 content_type = resp.headers.get("content-type", "")
+                retry_after_ms = _parse_retry_after_ms(resp.headers)
                 text = (await resp.aread()).decode(errors="replace")[:300]
                 status_code = resp.status_code
                 await resp.aclose()
@@ -2152,7 +2276,8 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                     return _error(400, last_error, "tool_not_supported", request_id=rid)
                 last_error = _anthropic_error_message(ch, url, status_code, text, content_type)
                 will_retry = has_next_channel and _retry_allowed(status_code, last_error)
-                finalize(ch, 0, 0, "error", status_code, last_error, will_retry)
+                finalize(ch, 0, 0, "error", status_code, last_error, will_retry,
+                         retry_after_ms=retry_after_ms)
                 if will_retry:
                     await _retry_pause(attempt_index)
                     continue
@@ -2844,7 +2969,8 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                 resp.headers.get("content-type", ""),
             )
             will_retry = has_next_channel and _retry_allowed(resp.status_code, last_error)
-            finalize(ch, 0, 0, "error", resp.status_code, last_error, will_retry)
+            finalize(ch, 0, 0, "error", resp.status_code, last_error, will_retry,
+                     retry_after_ms=_parse_retry_after_ms(resp.headers))
             if will_retry:
                 await _retry_pause(attempt_index)
                 continue
@@ -2995,7 +3121,7 @@ async def _embeddings(request: Request, body: dict, endpoint: str = "/v1/embeddi
     last_error = ""
 
     def finalize(ch, pt, status, code, err="", will_retry=False, breaker_failure=True,
-                 usage_source="unknown"):
+                 usage_source="unknown", retry_after_ms=0):
         input_price, _output_price = _pricing(model)
         cost = (pt if isinstance(pt, (int, float)) else 0) * input_price / 1_000_000
         latency = int((time.perf_counter() - start) * 1000)
@@ -3008,7 +3134,8 @@ async def _embeddings(request: Request, body: dict, endpoint: str = "/v1/embeddi
         if status == "success":
             _breaker_mark(ch["id"], True)
         elif breaker_failure:
-            _breaker_mark(ch["id"], False, reason=classify_upstream_error(code, err))
+            _breaker_mark(ch["id"], False, reason=classify_upstream_error(code, err),
+                          retry_after_ms=retry_after_ms)
 
     for attempt_index, ch in enumerate(candidates):
         if attempt_index:
@@ -3056,7 +3183,8 @@ async def _embeddings(request: Request, body: dict, endpoint: str = "/v1/embeddi
             last_error = upstream_error_message(ch["name"], resp.status_code, resp.text[:300],
                                                 ch["api_key"], resp.headers.get("content-type", ""))
             will_retry = has_next_channel and _retry_allowed(resp.status_code, last_error)
-            finalize(ch, 0, "error", resp.status_code, last_error, will_retry)
+            finalize(ch, 0, "error", resp.status_code, last_error, will_retry,
+                     retry_after_ms=_parse_retry_after_ms(resp.headers))
             if will_retry:
                 await _retry_pause(attempt_index)
                 continue
