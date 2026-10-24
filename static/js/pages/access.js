@@ -19,6 +19,16 @@ export async function renderAccess(el, { navigate, initialFilters = {}, isCurren
     grid.innerHTML = cards.length ? cards.map((c) => cardHtml(c)).join("") : emptyState("暂无反代家族");
     grid.querySelectorAll("[data-login-family]").forEach((button) => { button.onclick = () => startLogin(button, button.dataset.loginFamily, Number(button.dataset.channelId || 0)); });
     grid.querySelectorAll("[data-goto-channels]").forEach((button) => { button.onclick = () => navigate("channels"); });
+    grid.querySelectorAll("[data-signin]").forEach((button) => {
+      button.onclick = async () => {
+        button.disabled = true; button.textContent = "签到中…";
+        try {
+          const result = await api("/account-channels/signin/" + button.dataset.signin, { method: "POST" });
+          toast(result.ok ? (result.already ? "今天已签过" : "签到成功") : "签到失败：" + (result.error || ""), result.ok ? "success" : "err");
+        } catch (e) { toast("签到失败：" + e.message, "err"); }
+        finally { button.disabled = false; button.textContent = "一键签到"; }
+      };
+    });
   } catch (e) { grid.innerHTML = emptyState("加载失败", e.message); }
 }
 
@@ -30,6 +40,7 @@ function cardHtml(c) {
     <p class="subtle">${esc(c.vendor || "")} · 账号 ${c.accounts} · 模型 ${c.models}</p>
     <div class="toolbar mt-16">
       ${c.login !== "none" ? `<button class="btn sm primary" data-login-family="${c.family}" data-channel-id="${target}" type="button">登录 / 续期</button>` : ""}
+      ${c.family === "minimax" && c.channels.length ? `<button class="btn sm" data-signin="${c.channels[0].id}" type="button">一键签到</button>` : ""}
       <span class="spacer"></span><button class="btn sm" data-goto-channels type="button">去建渠道</button>
     </div>
   </article>`;

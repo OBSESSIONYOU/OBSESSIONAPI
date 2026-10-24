@@ -293,3 +293,67 @@ async def login_poll(request: Request, state: str = ""):
     if record.get("user_code"):
         out["user_code"] = record["user_code"]
     return out
+
+
+@router.get("/insights")
+def insights(request: Request, days: int = 30):
+    """Data dashboard: channel x model token pivot (requests/success/tokens/latency/cost)."""
+    require_admin(request)
+    from .database import query as _q
+    span = max(1, min(90, days))
+    since = "datetime('now', '-" + str(span) + " days')"
+    keys = ["requests", "ok", "pt", "ct", "cost", "avg_ms"]
+    by_channel = _q(
+        "SELECT channel_id, channel_name, COUNT(*) requests,"
+        " SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) ok,"
+        " SUM(COALESCE(prompt_tokens,0)) pt, SUM(COALESCE(completion_tokens,0)) ct,"
+        " SUM(COALESCE(cost,0)) cost, AVG(COALESCE(latency_ms,0)) avg_ms"
+        " FROM request_logs WHERE created_at >= " + since +
+        " GROUP BY channel_id, channel_name ORDER BY requests DESC LIMIT 50")
+    by_model = _q(
+        "SELECT model, COUNT(*) requests,"
+        " SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) ok,"
+        " SUM(COALESCE(prompt_tokens,0)) pt, SUM(COALESCE(completion_tokens,0)) ct,"
+        " SUM(COALESCE(cost,0)) cost, AVG(COALESCE(latency_ms,0)) avg_ms"
+        " FROM request_logs WHERE created_at >= " + since +
+        " GROUP BY model ORDER BY requests DESC LIMIT 50")
+    total = _q(
+        "SELECT COUNT(*) requests,"
+        " SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) ok,"
+        " SUM(COALESCE(prompt_tokens,0)) pt, SUM(COALESCE(completion_tokens,0)) ct,"
+        " SUM(COALESCE(cost,0)) cost, AVG(COALESCE(latency_ms,0)) avg_ms"
+        " FROM request_logs WHERE created_at >= " + since)[0]
+    def plain(r):
+        return {k: r[k] for k in keys}
+    return {
+        "days": span,
+        "total": plain(total),
+        "by_channel": [dict(r) for r in by_channel],
+        "by_model": [dict(r) for r in by_model],
+    }
+
+
+@router.post("/signin/{channel_id}")
+async def channel_signin(channel_id: int, request: Request):
+    """每日签到领额度（当前支持 MiniMax Code）。"""
+    require_admin(request)
+    from .database import query_one as _one
+    row = _one("SELECT id, type, api_key FROM channels WHERE id=?", (channel_id,))
+    if row is None:
+        from fastapi import HTTPException
+        raise HTTPException(404, "渠道不存在")
+    if row["type"] != "access_minimax":
+        return {"ok": False, "error": "该渠道不支持签到"}
+    import json as _json
+    from . import minimax_access
+    try:
+        credential = _json.loads(row["api_key"])
+        status = await minimax_access.signin_status(credential)
+        if not status.get("ok"):
+            return {"ok": False, "error": status.get("error", "查询签到状态失败")}
+        if status.get("signedIn") or status.get("todaySignedIn") or status.get("signed"):
+            return {"ok": True, "already": True, "detail": status}
+        result = await minimax_access.signin_claim(credential)
+        return {"ok": bool(result.get("ok")), "detail": result}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300]}

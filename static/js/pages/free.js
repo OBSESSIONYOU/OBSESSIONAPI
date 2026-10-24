@@ -3,12 +3,14 @@ import { $, esc } from "../core/dom.js";
 import { badge, emptyState, toast } from "../core/ui.js";
 import { pageHeader } from "../core/page.js";
 import { renderChannels } from "./channels.js";
+import { renderInsights } from "./insights.js";
 
 const TABS = [[
   ["free-models", "免费模型"],
   ["eac", "EAC 模型"],
   ["access", "白嫖模型接入"],
   ["channels", "渠道管理"],
+  ["insights", "数据看板"],
 ]];
 
 export async function renderFree(el, { navigate, initialFilters = {}, isCurrent } = {}) {
@@ -26,6 +28,7 @@ export async function renderFree(el, { navigate, initialFilters = {}, isCurrent 
   if (active === "channels") { await renderChannels(body, { navigate, isCurrent }); return; }
   if (active === "access") { body.innerHTML = '<div class="card"><p class="subtle">账号反代已独立为「接入反代」页，请从左侧导航进入。</p></div>'; return; }
   if (active === "eac") { await renderEac(body, refresh); return; }
+  if (active === "insights") { await renderInsights(body); return; }
   await renderFreeModels(body, refresh);
 }
 
