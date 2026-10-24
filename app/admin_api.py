@@ -646,6 +646,8 @@ def _channel_base_url(channel_type: str, value: str) -> str:
     if channel_type == "opencode_free":
         # 免费通道固定指向 opencode.ai；base_url 仅作展示，可留空
         return "https://opencode.ai"
+    if channel_type == "lobsterai":
+        return "https://lobsterai-server.youdao.com"
     try:
         if channel_type == "anthropic":
             return normalize_anthropic_base_url(value)

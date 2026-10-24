@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .database import execute, iso, query, query_one, utcnow
 from . import settings_store
 from . import opencode_free
+from . import lobsterai
 from .protocols import (
     PROTOCOLS,
     channel_protocol,
@@ -725,7 +726,7 @@ def header_names(headers: dict[str, str]) -> list[str]:
     return sorted({str(name).lower() for name in (headers or {})})
 
 
-ALLOWED_CHANNEL_TYPES = {"openai", "openai_chat", "anthropic", "openai_responses", "gemini", "mock", "auto", "opencode_free"}
+ALLOWED_CHANNEL_TYPES = {"openai", "openai_chat", "anthropic", "openai_responses", "gemini", "mock", "auto", "opencode_free", "lobsterai"}
 
 
 def validate_channel_type(value: str) -> str:
@@ -2579,6 +2580,80 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
         # ---- OpenAI 兼容上游（失败自动切换到下一个候选渠道）
         # opencode_free 渠道复用 OpenAI Chat 通道：仅替换 URL、鉴权头与请求体（指纹协议），
         # 流式/非流式/重试/熔断全部复用下方现成逻辑。
+        # ---- LobsterAI（有道）账号渠道：OAuth 凭据 + OpenAI 形状转发 + 401 自动刷新
+        if protocol == "lobsterai":
+            try:
+                lb_credential = lobsterai.parse_credential(ch["api_key"])
+            except ValueError as exc:
+                last_error = f"LobsterAI 渠道凭据无效：{exc}；请在渠道页重新登录。"
+                finalize(ch, 0, 0, "error", 400, last_error, False, breaker_failure=False)
+                return _error(400, last_error, "invalid_channel_credential", request_id=rid)
+            lb_credential = await lobsterai.ensure_fresh(lb_credential)
+            lb_url = lobsterai.API_BASE + lobsterai.CHAT_PATH
+            outbound_body = dict(outbound_body)
+            outbound_body.pop("stream", None)
+            for lb_attempt in range(2):
+                lb_headers = lobsterai.chat_headers(
+                    lb_credential["access_token"],
+                    lb_credential.get("version") or lobsterai.FALLBACK_VERSION,
+                    sse=bool(stream),
+                )
+                try:
+                    if stream:
+                        client = _http_client(ch, stream=True)
+                        req = client.build_request("POST", lb_url, json=outbound_body, headers=lb_headers)
+                        resp = await client.send(req, stream=True)
+                    else:
+                        async with _http_client(ch) as client:
+                            resp = await client.post(lb_url, json=outbound_body, headers=lb_headers)
+                except Exception as exc:  # noqa: BLE001
+                    last_error = upstream_error_message(ch["name"], 502, _request_error_detail(exc), "")
+                    finalize(ch, 0, 0, "error", 502, last_error, has_next_channel)
+                    if has_next_channel:
+                        await _retry_pause(attempt_index)
+                        continue
+                    return _error(502, last_error, "server_error", request_id=rid)
+                if resp.status_code in (401, 403) and lb_attempt == 0 and lobsterai.is_refreshable(lb_credential):
+                    await resp.aclose()
+                    if stream:
+                        await client.aclose()
+                    try:
+                        lb_credential = await lobsterai.refresh(lb_credential)
+                        execute("UPDATE channels SET api_key=? WHERE id=?", (lobsterai.credential_json(lb_credential), ch["id"]))
+                        continue
+                    except Exception:  # noqa: BLE001
+                        last_error = "LobsterAI 凭据过期且自动刷新失败，请重新登录。"
+                        finalize(ch, 0, 0, "error", 401, last_error, False, breaker_failure=False)
+                        return _error(401, last_error, "credential_expired", request_id=rid)
+                break
+            if resp.status_code != 200:
+                lb_detail = (await resp.aread()).decode(errors="replace")[:300]
+                if stream:
+                    await client.aclose()
+                last_error = upstream_error_message(ch["name"], resp.status_code, lb_detail, "")
+                will_retry = has_next_channel and _retry_allowed(resp.status_code, last_error)
+                finalize(ch, 0, 0, "error", resp.status_code, last_error, will_retry, retry_after_ms=_parse_retry_after_ms(resp.headers))
+                if will_retry:
+                    await _retry_pause(attempt_index)
+                    continue
+                return _error(resp.status_code, last_error, "server_error", request_id=rid)
+            if not stream:
+                try:
+                    lb_result = resp.json()
+                    lb_message = ((lb_result.get("choices") or [{}])[0].get("message") or {})
+                    if isinstance(lb_message.get("content"), str):
+                        lb_message["content"] = strip_seekai_attribution(lb_message["content"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    last_error = upstream_error_message(ch["name"], 502, "LobsterAI 响应格式不兼容", "")
+                    finalize(ch, 0, 0, "error", 502, last_error, has_next_channel)
+                    if has_next_channel:
+                        continue
+                    return _error(502, last_error, "server_error", request_id=rid)
+                lb_usage = lb_result.get("usage") or {}
+                pt, ct, usage_source = _usage_or_estimate(lb_usage, pt_est, _est_tokens(len(str(lb_message.get("content") or ""))))
+                finalize(ch, pt, ct, "success", 200, usage_source=usage_source, result=lb_result)
+                return JSONResponse(lb_result, headers={"X-Request-ID": rid})
+
         oc_free = protocol == "opencode_free"
         if oc_free:
             url = opencode_free.OPENCODE_BASE + "/inference/v1/chat/completions"

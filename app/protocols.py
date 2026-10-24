@@ -10,7 +10,7 @@ import re
 from urllib.parse import urlparse, urlunparse
 
 
-PROTOCOLS = {"auto", "openai_chat", "anthropic", "openai_responses", "gemini", "mock", "opencode_free"}
+PROTOCOLS = {"auto", "openai_chat", "anthropic", "openai_responses", "gemini", "mock", "opencode_free", "lobsterai"}
 LEGACY_PROTOCOLS = {"openai": "openai_chat"}
 
 _IGNORED_HOST_LABELS = {"api", "www", "openapi", "gateway", "console"}
