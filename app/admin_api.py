@@ -643,6 +643,9 @@ def _channel_base_url(channel_type: str, value: str) -> str:
         raise HTTPException(400, str(exc)) from exc
     if channel_type == "mock":
         return str(value or "").strip()
+    if channel_type == "opencode_free":
+        # 免费通道固定指向 opencode.ai；base_url 仅作展示，可留空
+        return "https://opencode.ai"
     try:
         if channel_type == "anthropic":
             return normalize_anthropic_base_url(value)

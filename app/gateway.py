@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .database import execute, iso, query, query_one, utcnow
 from . import settings_store
+from . import opencode_free
 from .protocols import (
     PROTOCOLS,
     channel_protocol,
@@ -724,7 +725,7 @@ def header_names(headers: dict[str, str]) -> list[str]:
     return sorted({str(name).lower() for name in (headers or {})})
 
 
-ALLOWED_CHANNEL_TYPES = {"openai", "openai_chat", "anthropic", "openai_responses", "gemini", "mock", "auto"}
+ALLOWED_CHANNEL_TYPES = {"openai", "openai_chat", "anthropic", "openai_responses", "gemini", "mock", "auto", "opencode_free"}
 
 
 def validate_channel_type(value: str) -> str:
@@ -2576,16 +2577,50 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                                      headers={"X-Accel-Buffering": "no", "X-Request-ID": rid})
 
         # ---- OpenAI 兼容上游（失败自动切换到下一个候选渠道）
-        try:
-            url = normalize_openai_base_url(ch["base_url"]) + "/chat/completions"
-        except ValueError as exc:
-            last_error = upstream_error_message(ch["name"], 502, str(exc), ch["api_key"])
-            finalize(ch, 0, 0, "error", 502, last_error, has_next_channel)
-            continue
-        headers = build_channel_headers(
-            ch, {"Authorization": f"Bearer {ch['api_key']}", "Content-Type": "application/json"},
-            request, "openai_chat"
-        )
+        # opencode_free 渠道复用 OpenAI Chat 通道：仅替换 URL、鉴权头与请求体（指纹协议），
+        # 流式/非流式/重试/熔断全部复用下方现成逻辑。
+        oc_free = protocol == "opencode_free"
+        if oc_free:
+            url = opencode_free.OPENCODE_BASE + "/inference/v1/chat/completions"
+            conv_key = str(request.headers.get("x-session-id") or request.headers.get("x-request-id") or rid)
+            outbound_body = opencode_free.apply_fingerprint(outbound_body)
+            headers = build_channel_headers(
+                ch, opencode_free.gateway_headers(opencode_free.session_for(conv_key), stream=True),
+                request, "opencode_free"
+            )
+            if not stream:
+                # 免费闸门要求 stream=true：非流式客户端在此聚合回普通 completion
+                try:
+                    async with _http_client(ch, stream=True) as client:
+                        oc_result, oc_code, oc_err = await opencode_free.complete_nonstream(client, url, headers, outbound_body)
+                except Exception as exc:  # noqa: BLE001
+                    oc_result, oc_code, oc_err = None, 502, _request_error_detail(exc)
+                if oc_result is None:
+                    last_error = upstream_error_message(ch["name"], oc_code, oc_err, "")
+                    will_retry = has_next_channel and _retry_allowed(oc_code, last_error)
+                    finalize(ch, 0, 0, "error", oc_code, last_error, will_retry)
+                    if will_retry:
+                        await _retry_pause(attempt_index)
+                        continue
+                    return _error(oc_code if oc_code == 429 else 502, last_error,
+                                  "free_usage_limit" if oc_code == 429 else "server_error", request_id=rid)
+                message = ((oc_result.get("choices") or [{}])[0].get("message") or {})
+                if isinstance(message.get("content"), str):
+                    message["content"] = strip_seekai_attribution(message["content"])
+                pt, ct, usage_source = _usage_or_estimate(oc_result.get("usage") or {}, pt_est, _est_tokens(len(str(message.get("content") or ""))))
+                finalize(ch, pt, ct, "success", 200, usage_source=usage_source, result=oc_result)
+                return JSONResponse(oc_result, headers={"X-Request-ID": rid})
+        else:
+            try:
+                url = normalize_openai_base_url(ch["base_url"]) + "/chat/completions"
+            except ValueError as exc:
+                last_error = upstream_error_message(ch["name"], 502, str(exc), ch["api_key"])
+                finalize(ch, 0, 0, "error", 502, last_error, has_next_channel)
+                continue
+            headers = build_channel_headers(
+                ch, {"Authorization": f"Bearer {ch['api_key']}", "Content-Type": "application/json"},
+                request, "openai_chat"
+            )
 
         if stream:
             client = _http_client(ch, stream=True)
