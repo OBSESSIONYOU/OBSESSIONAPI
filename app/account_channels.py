@@ -342,11 +342,19 @@ def insights(request: Request, days: int = 30):
         " FROM request_logs WHERE created_at >= " + since)[0]
     def plain(r):
         return {k: r[k] for k in keys}
+    by_day = _q(
+        "SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS requests,"
+        " SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) AS ok,"
+        " SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) AS tokens"
+        " FROM request_logs WHERE created_at >= " + since +
+        " GROUP BY day ORDER BY day DESC LIMIT 30")
+
     return {
         "days": span,
         "total": plain(total),
         "by_channel": [dict(r) for r in by_channel],
         "by_model": [dict(r) for r in by_model],
+        "by_day": by_day,
     }
 
 
