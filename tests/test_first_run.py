@@ -725,7 +725,7 @@ class FirstRunTests(unittest.TestCase):
         ])
         self.assertEqual(length_response.status_code, 200, length_response.text)
         self.assertEqual(length_response.headers.get("X-OBSESSIONAPI-Completion-State"), "incomplete")
-        self.assertIn('"finish_reason": "length"', length_response.text)
+        self.assertRegex(length_response.text, r'"finish_reason":\s*"length"')
         self.assertEqual(_sse_payloads(length_response.text).count("[DONE]"), 1)
 
     def test_legacy_completions_translates_prompt_to_chat_messages(self):

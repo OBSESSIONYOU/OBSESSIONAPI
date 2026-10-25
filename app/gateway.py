@@ -3012,7 +3012,9 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                 )
                 await resp.aclose()
                 await client.aclose()
+                fallback_code = 502  # no-fallback else-branch default; overwritten by the fallback path
                 if "tools" not in outbound_body and not (isinstance(ch, dict) and ch.get("_account_family")):
+                    fallback_code = 502  # 无兜底路径时的缺省，供末尾状态映射
                     fallback_result, fallback_code, fallback_message = await _fallback_completion(
                         ch, url, outbound_body, headers
                     )

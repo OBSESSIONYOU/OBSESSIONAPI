@@ -110,6 +110,48 @@ class ProtocolStreamEventsTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_closing_after_native_terminal_records_its_outcome_once(self):
+        for protocol in ("openai_responses", "gemini", "access_gemini"):
+            for terminal in ("success", "incomplete", "error"):
+                with self.subTest(protocol=protocol, terminal=terminal):
+                    records, closed = [], []
+                    class Closable:
+                        async def aclose(self):
+                            await asyncio.sleep(0)
+                            closed.append(True)
+
+                    if protocol == "openai_responses":
+                        initial = {"type": "response.output_text.delta", "delta": "OK"}
+                        final = {"type": "response.completed", "response": {}}
+                        if terminal == "incomplete":
+                            final = {"type": "response.incomplete", "response": {
+                                "incomplete_details": {"reason": "max_output_tokens"}}}
+                    else:
+                        initial = {"candidates": [{"content": {"parts": [{"text": "OK"}]}}]}
+                        final = {"candidates": [{"finishReason": "MAX_TOKENS" if terminal == "incomplete" else "STOP"}]}
+                        if protocol == "access_gemini":
+                            initial, final = {"response": initial}, {"response": final}
+                    if terminal == "error":
+                        final = {"error": {"message": "fixture failure"}}
+
+                    async def run():
+                        async def lines():
+                            yield "data: " + json.dumps(final)
+                            await asyncio.Event().wait()
+
+                        relay = gateway._protocol_stream_relay((Closable(), Closable(), lines(), [initial]),
+                            {"name": "fixture", "api_key": "fixture"}, protocol, "m",
+                            lambda *a, **kw: records.append((a, kw)), 1)
+                        await anext(relay)
+                        await anext(relay)
+                        await relay.aclose()
+
+                    asyncio.run(run())
+                    self.assertEqual(len(closed), 2)
+                    self.assertEqual(len(records), 1)
+                    expected = ("success", 200) if terminal == "success" else ("error", 502 if terminal == "error" else 200)
+                    self.assertEqual(records[0][0][3:5], expected)
+
     def test_cancelling_stream_prefetch_closes_owned_client_and_response(self):
         class Response:
             status_code = 200

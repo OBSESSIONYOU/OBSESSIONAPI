@@ -65,10 +65,11 @@ class GeminiProtocolTests(unittest.TestCase):
         body = {"messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]}
         url, envelope = gemini_access.build_stream_request(body, "gemini-2.5-pro", "proj-1", "seed")
         self.assertIn("streamGenerateContent?alt=sse", url)
-        roles = [c["role"] for c in envelope["contents"]]
-        self.assertEqual(roles, ["user", "user", "model"])
+        roles = [c["role"] for c in envelope["request"]["contents"]]
+        self.assertEqual(roles, ["user", "model"])
+        self.assertEqual(envelope["request"]["systemInstruction"]["parts"], [{"text": "sys"}])
         self.assertEqual(envelope["project"], "proj-1")
-        self.assertTrue(envelope["sessionId"])
+        self.assertTrue(envelope["request"]["sessionId"])
 
     def test_sse_chunk_translation(self):
         line = 'data: {"candidates":[{"content":{"parts":[{"text":"OK"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}}'
