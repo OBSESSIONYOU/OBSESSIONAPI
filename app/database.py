@@ -9,7 +9,9 @@ from pathlib import Path
 
 from .secrets import decrypt_secret, encrypt_secret, is_encrypted
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+import os as _os
+_DATA_ENV = _os.environ.get("OBSESSIONAPI_DATA_DIR")
+DATA_DIR = Path(_DATA_ENV) if _DATA_ENV else Path(__file__).resolve().parents[1] / "data"
 DB_PATH = DATA_DIR / "obsessionapi.db"
 
 _lock = threading.Lock()

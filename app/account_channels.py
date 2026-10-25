@@ -357,3 +357,41 @@ async def channel_signin(channel_id: int, request: Request):
         return {"ok": bool(result.get("ok")), "detail": result}
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:300]}
+
+
+@router.get("/balance/{channel_id}")
+async def channel_balance(channel_id: int, request: Request):
+    """Remaining balance: LobsterAI profile-summary; MiniMax credit details points."""
+    require_admin(request)
+    from .database import query_one as _one
+    import json as _json
+    row = _one("SELECT id, type, api_key FROM channels WHERE id=?", (channel_id,))
+    if row is None:
+        from fastapi import HTTPException
+        raise HTTPException(404, "channel not found")
+    if row["type"] == "lobsterai":
+        import httpx
+        try:
+            credential = lobsterai.parse_credential(row["api_key"])
+            version = credential.get("version") or lobsterai.FALLBACK_VERSION
+            headers = lobsterai.chat_headers(credential["access_token"], version, sse=False)
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(lobsterai.API_BASE + "/api/user/profile-summary", headers=headers)
+            if r.status_code != 200:
+            # fallthrough below
+                return {"ok": False, "error": "HTTP %d" % r.status_code}
+            data = (r.json() or {}).get("data") or {}
+            remaining = data.get("creditsRemaining")
+            rounded = round(float(remaining), 2) if isinstance(remaining, (int, float)) else None
+            return {"ok": True, "kind": "credits", "remaining": rounded}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+    if row["type"] == "access_minimax":
+        from . import minimax_access
+        try:
+            credential = _json.loads(row["api_key"])
+            result = await minimax_access.credit_points(credential)
+            return {"ok": True, "kind": "points", "remaining": result.get("points", 0)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+    return {"ok": False, "error": "no balance for this family"}

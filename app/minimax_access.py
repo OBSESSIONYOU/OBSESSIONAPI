@@ -160,3 +160,23 @@ def openai_to_anthropic_body(openai_body: dict, model: str) -> dict:
     if system_text:
         body["system"] = system_text
     return body
+
+
+async def credit_points(credential: dict) -> dict:
+    """Sum credit points from /minimax-cloud/api/v1/credit/details."""
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_S) as client:
+        r = await client.get(
+            API_HOST + '/minimax-cloud/api/v1/credit/details',
+            params={"timezone_id": "Asia/Shanghai"},
+            headers=_headers(credential),
+        )
+    if r.status_code != 200:
+        return {"points": 0, "error": "HTTP %d" % r.status_code}
+    payload = r.json()
+    data = payload.get("data") or payload
+    items = data.get("list") or data.get("credits") or []
+    total = 0.0
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict):
+            total += float(item.get("points") or 0)
+    return {"points": round(total, 2)}

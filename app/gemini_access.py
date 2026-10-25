@@ -146,29 +146,22 @@ async def resolve_project(credential: dict) -> str:
 
 
 def build_stream_request(openai_body: dict, model: str, project: str, session_seed: str):
-    contents = []
-    system_text = ""
-    for message in openai_body.get("messages") or []:
-        role = message.get("role")
-        raw = message.get("content")
-        text = raw if isinstance(raw, str) else json.dumps(raw or "", ensure_ascii=False)
-        if role == "system":
-            system_text += ( chr(10) if system_text else "" ) + str(text)
-            continue
-        contents.append({"role": "user" if role != "assistant" else "model", "parts": [{"text": str(text)}]})
-    if system_text:
-        contents.insert(0, {"role": "user", "parts": [{"text": system_text}]})
+    from .protocols import openai_to_gemini
+    from .account_transport import text_messages, validate_request
+    validate_request("access_gemini", openai_body)
+    native = openai_to_gemini(text_messages(openai_body))
+    for tool in native.get("tools", []):
+        if "function_declarations" in tool:
+            tool["functionDeclarations"] = tool.pop("function_declarations")
     session_id = hashlib.sha256(("%s:%s" % (project, session_seed)).encode()).hexdigest()[:32]
+    native["sessionId"] = session_id
     envelope = {
         "model": model,
         "project": project,
         "requestId": hashlib.sha1(str(time.time()).encode()).hexdigest()[:16],
-        "sessionId": session_id,
-        "contents": contents,
-        "generationSettings": {"temperature": openai_body.get("temperature", 1.0)},
+        "request": native,
+        "userAgent": "antigravity",
     }
-    if openai_body.get("max_tokens"):
-        envelope["generationSettings"]["maxOutputTokens"] = openai_body["max_tokens"]
     return ENDPOINTS[0] + STREAM_PATH, envelope
 
 

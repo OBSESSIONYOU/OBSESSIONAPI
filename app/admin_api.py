@@ -40,6 +40,7 @@ from .gateway import (
 from . import database, settings_store
 from .secrets import encrypt_secret
 from .protocols import (
+    ACCOUNT_PROTOCOLS,
     channel_protocol,
     gemini_to_openai,
     normalize_gemini_base_url,
@@ -1127,6 +1128,8 @@ async def detect_channel(request: Request):
         requested_protocol = normalize_protocol(d.get("protocol", row["type"] if row else "auto"))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if requested_protocol in ACCOUNT_PROTOCOLS or (row and channel_protocol(row) in ACCOUNT_PROTOCOLS):
+        raise HTTPException(400, "账号渠道使用专用协议，不支持通用协议检测；请使用账号登录与已绑定模型。")
     raw_base_url = str(d.get("base_url") or (row["base_url"] if row else "")).strip()
     if not raw_base_url:
         raise HTTPException(400, "请先填写 Base URL")
@@ -1276,6 +1279,48 @@ async def channels_test(cid: int, request: Request):
             ok, msg, status_code = True, "本地模拟渠道测试通过（不会产生上游额度）", 200
             completion_state = "valid"
             response_summary = msg
+        elif protocol in ACCOUNT_PROTOCOLS:
+            from . import account_transport, opencode_free
+            payload = {"model": upstream_model, "messages": [{"role": "user", "content": "Reply only OK"}],
+                       "max_tokens": test_max_tokens, "stream": True}
+            if protocol == "opencode_free":
+                request_url = opencode_free.OPENCODE_BASE + "/inference/v1/chat/completions"
+                payload = opencode_free.apply_fingerprint(payload)
+                headers = build_channel_headers(ch, opencode_free.gateway_headers(opencode_free.mint_session_id(), stream=True),
+                                                request, protocol)
+                sent_header_names = header_names(headers)
+                try:
+                    async with _http_client(ch, stream=True) as client:
+                        converted, status_code, detail = await opencode_free.complete_nonstream(client, request_url, headers, payload)
+                except Exception:
+                    converted, status_code, detail = None, 502, "账号上游响应无效或流式连接异常结束"
+            else:
+                try:
+                    prepared = await account_transport.prepare_channel(ch, payload)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                if prepared.get("_updated_credential") is not None:
+                    execute("UPDATE channels SET api_key=? WHERE id=?",
+                            (json.dumps(prepared["_updated_credential"], ensure_ascii=False), ch["id"]))
+                request_url = _public_url(prepared["_account_url"])
+                sent_header_names = header_names(prepared["_account_headers"])
+                try:
+                    async with _http_client(prepared, stream=True) as client:
+                        converted, status_code, detail = await account_transport.complete_nonstream(client, prepared, payload, test_model)
+                except Exception:
+                    converted, status_code, detail = None, 502, "账号上游响应无效或流式连接异常结束"
+            if converted is None:
+                ok, msg = False, upstream_error_message(ch["name"], status_code, detail)
+                response_summary = msg
+            else:
+                completion_state = _chat_response_state(converted)
+                if ((converted.get("choices") or [{}])[0].get("finish_reason")) in {"length", "max_tokens"}:
+                    completion_state = "incomplete"
+                ok = completion_state == "valid"
+                msg = ("账号渠道真实推理测试通过" if ok else
+                       "请求已返回，但输出预算耗尽，未取得最终回答（finish_reason=length）" if completion_state == "incomplete" else
+                       "推理失败；渠道协议错误：账号上游没有返回有效文本、拒答或工具调用")
+                response_summary = msg
         elif protocol == "anthropic":
             base_url = normalize_anthropic_base_url(ch["base_url"])
             messages_url = base_url + "/v1/messages"
@@ -1454,11 +1499,14 @@ async def channels_test(cid: int, request: Request):
                 )
                 prefix = "模型列表正常、推理失败；" if model_list_status_code == 200 else "推理失败；"
                 msg = prefix + summary + "；真实推理测试可能产生极少量额度"
+    except HTTPException:
+        raise
     except httpx.RequestError as exc:
         ok, msg, status_code = False, upstream_error_message(ch["name"], 502, str(exc), ch["api_key"]), 502
         response_summary = msg
     except Exception as exc:  # noqa: BLE001
-        ok, msg, status_code = False, upstream_error_message(ch["name"], 502, str(exc), ch["api_key"]), 502
+        detail = "账号凭据刷新失败或响应不兼容，请重新登录后重试" if protocol in ACCOUNT_PROTOCOLS else str(exc)
+        ok, msg, status_code = False, upstream_error_message(ch["name"], 502, detail, ch["api_key"]), 502
         response_summary = msg
     if not ok:
         error_category = (
@@ -1517,6 +1565,9 @@ async def discover_channel_models(request: Request):
         channel_type = validate_channel_type(d.get("type", "openai"))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    row = query_one("SELECT * FROM channels WHERE id=?", (d["channel_id"],)) if d.get("channel_id") else None
+    if channel_type in ACCOUNT_PROTOCOLS or (row and channel_protocol(row) in ACCOUNT_PROTOCOLS):
+        raise HTTPException(400, "账号渠道不支持通用模型列表加载，请使用账号页面的模型清单或手动填写模型 ID。")
     if channel_type == "anthropic":
         raise HTTPException(400, "Anthropic Messages 没有统一的模型列表接口，请手动填写模型 ID")
     base_url = _channel_base_url(channel_type, d.get("base_url", ""))
@@ -1524,9 +1575,7 @@ async def discover_channel_models(request: Request):
         raise HTTPException(400, "请先填写 Base URL")
     api_key = str(d.get("api_key", ""))
     channel_name = _channel_name(base_url)
-    row = None
     if not api_key and d.get("channel_id"):
-        row = query_one("SELECT name, api_key, extra_headers, forward_headers, user_agent, proxy_url, connect_timeout_s, read_timeout_s FROM channels WHERE id=?", (d["channel_id"],))
         if row:
             channel_name = row["name"] or channel_name
             api_key = row["api_key"]

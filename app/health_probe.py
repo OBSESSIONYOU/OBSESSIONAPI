@@ -14,7 +14,7 @@ from .gateway import (
     normalize_openai_base_url,
     upstream_error_message,
 )
-from .protocols import channel_protocol, normalize_gemini_base_url
+from .protocols import ACCOUNT_PROTOCOLS, channel_protocol, normalize_gemini_base_url
 
 
 async def probe_channel(channel) -> dict:
@@ -27,6 +27,10 @@ async def probe_channel(channel) -> dict:
     try:
         if protocol == "mock":
             ok, status_code = True, 200
+        elif protocol in ACCOUNT_PROTOCOLS:
+            # These lanes use private account protocols, not a generic /models API.
+            status_code = 400
+            error = "账号渠道不支持通用模型列表探测，请通过 API 接入发起推理验证。"
         else:
             if protocol == "anthropic":
                 url = normalize_anthropic_base_url(channel["base_url"]) + "/v1/models"
@@ -57,7 +61,7 @@ async def probe_channel(channel) -> dict:
         status_code = 502
     latency = max(1, int((time.perf_counter() - started) * 1000))
     category = "" if ok else (
-        "model_list_unavailable" if protocol == "anthropic" and status_code in {404, 405}
+        "model_list_unavailable" if protocol in ACCOUNT_PROTOCOLS or (protocol == "anthropic" and status_code in {404, 405})
         else classify_upstream_error(status_code, error)
     )
     return {

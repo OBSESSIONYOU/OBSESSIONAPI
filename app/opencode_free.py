@@ -23,6 +23,9 @@ import hashlib
 import json
 import threading
 import time
+from contextlib import asynccontextmanager
+
+from anyio import CancelScope
 
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
@@ -244,70 +247,137 @@ def apply_fingerprint(body: dict) -> dict:
 
 
 
-async def complete_nonstream(client, url, headers, body):
-    """非流式桥：免费闸门要求 stream=true，这里发流式、聚合回 chat.completion 形状。"""
-    wire = dict(body)
-    wire["stream"] = True
-    chunks = []
-    try:
-        async with client.stream("POST", url, headers=headers, json=wire) as resp:
-            if resp.status_code != 200:
-                text = (await resp.aread()).decode(errors="replace")[:300]
-                return None, resp.status_code, text
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    chunks.append(json.loads(data))
-                except ValueError:
-                    continue
-    except Exception as exc:
-        return None, 502, f"免费通道网络错误：{exc}"
-    if not chunks:
-        return None, 502, "免费通道返回空流"
-    first = chunks[0]
+def collect_openai_chunks(chunks, body: dict, *, terminated: bool = False) -> dict:
+    """Fold one provider choice; never invent success for errors or an abnormal EOF."""
+    first = None
     message = {"role": "assistant", "content": ""}
-    tool_calls = []
+    slots = {}
+    legacy = None
     finish_reason = None
     usage = None
     for chunk in chunks:
-        for choice in chunk.get("choices") or []:
+        if not isinstance(chunk, dict):
+            raise ValueError("上游 SSE 顶层不是对象")
+        if chunk.get("error") or chunk.get("type") == "error":
+            raise ValueError("上游 SSE 返回错误")
+        if first is None:
+            first = chunk
+        choices = chunk.get("choices") or []
+        if not isinstance(choices, list):
+            raise ValueError("上游 choices 不是数组")
+        for choice in choices:
+            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                raise ValueError("聚合桥只支持单个有效 choice")
             delta = choice.get("delta") or {}
-            if isinstance(delta.get("content"), str):
-                message["content"] += delta["content"]
+            if not isinstance(delta, dict):
+                raise ValueError("上游 delta 不是对象")
+            for field in ("content", "refusal", "reasoning_content"):
+                if delta.get(field) is not None:
+                    if not isinstance(delta[field], str):
+                        raise ValueError("上游文本分片不是字符串")
+                    message[field] = message.get(field, "") + delta[field]
+            if delta.get("function_call") is not None:
+                function = delta["function_call"]
+                if not isinstance(function, dict):
+                    raise ValueError("上游 function_call 分片格式无效")
+                if legacy is None:
+                    legacy = {"name": "", "arguments": ""}
+                for field in ("name", "arguments"):
+                    if function.get(field) is not None:
+                        if not isinstance(function[field], str):
+                            raise ValueError("上游 function_call 字段不是字符串")
+                        legacy[field] += function[field]
             for call in delta.get("tool_calls") or []:
-                idx = int(call.get("index") or 0)
-                while len(tool_calls) <= idx:
-                    tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
-                slot = tool_calls[idx]
+                if not isinstance(call, dict) or not isinstance(call.get("index", 0), int) or isinstance(call.get("index"), bool):
+                    raise ValueError("上游工具分片索引无效")
+                idx = call.get("index", 0)
+                if not 0 <= idx < 128:
+                    raise ValueError("上游工具分片索引超出范围")
+                slot = slots.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
                 if call.get("id"):
                     slot["id"] = call["id"]
                 fn = call.get("function") or {}
-                if fn.get("name"):
-                    slot["function"]["name"] += fn["name"]
-                if fn.get("arguments"):
-                    slot["function"]["arguments"] += fn["arguments"]
+                if not isinstance(fn, dict):
+                    raise ValueError("上游工具分片格式无效")
+                for field in ("name", "arguments"):
+                    if fn.get(field) is not None:
+                        if not isinstance(fn[field], str):
+                            raise ValueError("上游工具字段不是字符串")
+                        slot["function"][field] += fn[field]
             if choice.get("finish_reason"):
                 finish_reason = choice["finish_reason"]
         if isinstance(chunk.get("usage"), dict):
             usage = chunk["usage"]
-    if tool_calls:
-        message["tool_calls"] = tool_calls
-    if not message["content"] and not tool_calls:
+    if not first or (not terminated and not finish_reason):
+        raise ValueError("上游流式响应异常结束")
+    if slots:
+        message["tool_calls"] = [slots[index] for index in sorted(slots)]
+        if finish_reason != "length":
+            for call in message["tool_calls"]:
+                if not call["id"] or not call["function"]["name"]:
+                    raise ValueError("上游工具调用缺少 id 或函数名")
+                args = json.loads(call["function"]["arguments"])
+                if not isinstance(args, dict):
+                    raise ValueError("上游工具参数不是 JSON 对象")
+    if legacy is not None:
+        message["function_call"] = legacy
+        if finish_reason != "length":
+            if not legacy["name"]:
+                raise ValueError("上游 function_call 缺少函数名")
+            if not isinstance(json.loads(legacy["arguments"]), dict):
+                raise ValueError("上游 function_call 参数不是 JSON 对象")
+    if not message["content"]:
         message["content"] = None
+    if not (message.get("content") or message.get("refusal") or slots or legacy) and finish_reason != "length":
+        raise ValueError("上游流式响应没有有效输出")
     result = {
-        "id": first.get("id") or "chatcmpl-opencode-free",
-        "object": "chat.completion",
-        "created": first.get("created") or int(time.time()),
-        "model": first.get("model") or wire.get("model"),
+        "id": first.get("id") or "chatcmpl-account",
+        "object": "chat.completion", "created": first.get("created") or int(time.time()),
+        "model": first.get("model") or body.get("model"),
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason or "stop"}],
     }
-    if usage:
+    if usage is not None:
         result["usage"] = usage
-    return result, 200, ""
+    return result
+
+
+@asynccontextmanager
+async def closing_stream(client, url, headers, body):
+    """Close an SSE response even while its task is being cancelled."""
+    async with client.stream("POST", url, headers=headers, json=body) as response:
+        try:
+            yield response
+        finally:
+            with CancelScope(shield=True):
+                await response.aclose()
+
+
+async def complete_nonstream(client, url, headers, body):
+    """SSE-only upstream -> Chat completion, validating errors, framing and terminal state."""
+    from .sse import iter_sse_json_lines
+    wire = dict(body)
+    wire["stream"] = True
+    chunks = []
+    terminated = False
+    async with closing_stream(client, url, headers, wire) as resp:
+        if resp.status_code != 200:
+            await resp.aread()
+            return None, resp.status_code, "上游拒绝请求"
+        try:
+            async for line in iter_sse_json_lines(resp.aiter_lines()):
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    terminated = True
+                    break
+                frame = json.loads(data)
+                if frame.get("error") or frame.get("type") == "error":
+                    return None, 502, "上游 SSE 返回错误"
+                chunks.append(frame)
+            return collect_openai_chunks(chunks, wire, terminated=terminated), 200, ""
+        except (TypeError, ValueError) as exc:
+            # These are locally generated diagnostics, never raw credential-bearing bodies.
+            return None, 502, str(exc)[:200]
+
 
 
 def restore_tool_names(payload: dict, renamed: list[dict]) -> dict:

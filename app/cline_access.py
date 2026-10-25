@@ -77,4 +77,4 @@ def chat_headers(credential: dict) -> dict:
     return headers
 
 
-CHAT_PATH = "/v1/chat/completions"
+CHAT_PATH = "/api/v1/chat/completions"

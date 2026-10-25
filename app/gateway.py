@@ -3,16 +3,20 @@ import asyncio
 import hashlib
 import logging
 import json
+import math
 import random
 import re
 import secrets
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from fnmatch import fnmatchcase
 from typing import AsyncIterator
+from threading import Lock
 from urllib.parse import quote, urlparse, urlunparse
 
 import httpx
+from anyio import CancelScope
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -20,6 +24,7 @@ from .database import execute, iso, query, query_one, utcnow
 from . import settings_store
 from . import opencode_free
 from . import lobsterai
+from .sse import iter_sse_json_lines
 from .protocols import (
     PROTOCOLS,
     channel_protocol,
@@ -54,7 +59,7 @@ MAX_CHANNEL_ATTEMPTS = 3
 ERROR_CATEGORIES = {
     "auth", "rate_limit", "timeout", "upstream_5xx", "model_not_found",
     "content_filter", "invalid_request", "network", "protocol_error", "tool_not_supported",
-    "incomplete_output",
+    "incomplete_output", "client_disconnected",
 }
 
 
@@ -66,6 +71,8 @@ def classify_upstream_error(status_code: int | None, body_text: str = "", exc: E
         return "network"
     code = int(status_code or 0)
     text = str(body_text or "").lower()
+    if code == 499:
+        return "client_disconnected"
     if code in {401, 403} or any(mark in text for mark in ("unauthorized", "invalid api key", "authentication")):
         return "auth"
     if code == 429 or any(mark in text for mark in ("rate limit", "too many requests", "限流", "频率")):
@@ -435,6 +442,10 @@ def _invalid_response_detail(result) -> str:
 
 
 async def _fallback_completion(channel, url: str, body: dict, headers: dict):
+    if _channel_rate_exceeded(channel["id"], _int_field(channel, "rpm_limit")):
+        return None, 429, upstream_error_message(
+            channel["name"], 429, "channel rate limit reached; fallback not sent", channel["api_key"])
+    _channel_rate_consume(channel["id"], _int_field(channel, "rpm_limit"))
     fallback_body = {key: value for key, value in body.items() if key != "stream"}
     try:
         async with _http_client(channel) as fallback_client:
@@ -465,6 +476,10 @@ async def _fallback_completion(channel, url: str, body: dict, headers: dict):
 
 
 async def _fallback_anthropic_completion(channel, url: str, body: dict, headers: dict, requested_model: str):
+    if _channel_rate_exceeded(channel["id"], _int_field(channel, "rpm_limit")):
+        return None, 429, _anthropic_error_message(
+            channel, url, 429, "channel rate limit reached; fallback not sent")
+    _channel_rate_consume(channel["id"], _int_field(channel, "rpm_limit"))
     fallback_body = {key: value for key, value in body.items() if key != "stream"}
     try:
         async with _http_client(channel) as fallback_client:
@@ -1090,29 +1105,34 @@ def load_breaker_state() -> None:
 
 
 # ---- 分级冷却（借鉴 zzcsapi）：不同错误需要不同耐心 ----
-# 凭证/配置类（auth、invalid_request、model_not_found、content_filter）：一分钟内绝不可能自愈，
+# 凭证/配置类（auth、model_not_found）：一分钟内绝不可能自愈，
 #   直接用配置的 cooldown_seconds（默认 300s），避免拿真流量反复撞墙；
 # 限流（rate_limit）：上游说"别急"——优先听 Retry-After，没有就 60s 起；
 # 瞬时故障（timeout / upstream_5xx / network 等）：指数退避 5s * 2^(n-1)，封顶 cooldown_seconds，
 #   偶发抖动不再被一刀切罚 5 分钟。
 _COOLDOWN_TRANSIENT_BASE_S = 5
 _COOLDOWN_RATE_LIMIT_S = 60
-_COOLDOWN_HARD_CATEGORIES = {"auth", "invalid_request", "model_not_found", "content_filter", "tool_not_supported", "protocol_error"}
+_COOLDOWN_HARD_CATEGORIES = {"auth", "model_not_found", "tool_not_supported", "protocol_error"}
+_REQUEST_ERROR_CATEGORIES = {"invalid_request", "content_filter", "client_disconnected"}
 
 
 def _parse_retry_after_ms(headers) -> int:
     """解析上游 Retry-After（RFC 9110：秒数或 HTTP 日期），返回毫秒；解析不出返回 0。"""
     try:
-        raw = headers.get("retry-after") if hasattr(headers, "get") else None
+        raw = (headers.get("retry-after") or headers.get("Retry-After")) if hasattr(headers, "get") else None
         if not raw:
             return 0
         text = str(raw).strip()
         import re as _re
         if _re.fullmatch(r"\d+(\.\d+)?", text):
-            return int(float(text) * 1000)
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00")) if "T" in text or "-" in text else None
-        if parsed is not None:
-            return max(0, int(parsed.timestamp() * 1000 - time.time() * 1000))
+            return math.ceil(float(text) * 1000)
+        try:
+            parsed = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0, math.ceil((parsed.timestamp() - time.time()) * 1000))
     except Exception:  # noqa: BLE001
         pass
     return 0
@@ -1123,7 +1143,7 @@ def _cooldown_seconds_for(streak: int, reason: str, retry_after_ms: int = 0) -> 
     cap = max(1, int(_settings()["cooldown_seconds"]))
     if reason == "rate_limit":
         if retry_after_ms > 0:
-            return max(1, min(cap, retry_after_ms // 1000))
+            return max(1, min(cap, math.ceil(retry_after_ms / 1000)))
         return max(1, min(cap, _COOLDOWN_RATE_LIMIT_S))
     if reason in _COOLDOWN_HARD_CATEGORIES:
         return cap
@@ -1139,6 +1159,8 @@ def _breaker_mark(channel_id: int, ok: bool, reason: str = "", retry_after_ms: i
     失败计数减半、清冷却，但保留观察期标志——候选排序仍排在健康渠道之后，
     直到一次真实成功才彻底清零（探测活着 ≠ 对话能用）。
     """
+    if not ok and reason in _REQUEST_ERROR_CATEGORIES:
+        return  # 请求错误仍记日志，但不能改变渠道自身的健康状态。
     st = _BREAKER.get(channel_id) or _breaker_default()
     if ok:
         if real_completion or not (st.get("streak") or st.get("cooldown_count") or st.get("probation")):
@@ -1312,6 +1334,7 @@ _RATE: dict[int, list] = {}
 _CONCURRENCY: dict[int, int] = {}
 # ---- 渠道级出网上游请求速率（保护上游，避免被上游封禁）
 _CHANNEL_RATE: dict[int, list] = {}
+_CHANNEL_RATE_LOCK = Lock()
 
 
 def key_allowed_models(key_row) -> set[str]:
@@ -1375,25 +1398,30 @@ def _channel_rate_exceeded(channel_id: int, limit: int) -> bool:
     """渠道每分钟上游请求数是否已达上限（只读检查，不消费配额）。limit<=0 表示不限。"""
     if limit <= 0:
         return False
-    window = _CHANNEL_RATE.get(channel_id)
-    if not window:
-        return False
-    cutoff = time.time() - 60
-    while window and window[0] < cutoff:
-        window.pop(0)
-    return len(window) >= limit
+    with _CHANNEL_RATE_LOCK:
+        window = _CHANNEL_RATE.get(channel_id)
+        if not window:
+            return False
+        cutoff = time.time() - 60
+        while window and window[0] < cutoff:
+            window.pop(0)
+        return len(window) >= limit
 
 
-def _channel_rate_consume(channel_id: int, limit: int) -> None:
-    """渠道被选中发起上游请求时占用一个窗口配额。"""
+def _channel_rate_consume(channel_id: int, limit: int) -> bool:
+    """发送前原子检查并占用渠道窗口配额；候选列表可能因并发已过时。"""
     if limit <= 0:
-        return
-    now = time.time()
-    window = _CHANNEL_RATE.setdefault(channel_id, [])
-    cutoff = now - 60
-    while window and window[0] < cutoff:
-        window.pop(0)
-    window.append(now)
+        return True
+    with _CHANNEL_RATE_LOCK:
+        now = time.time()
+        window = _CHANNEL_RATE.setdefault(channel_id, [])
+        cutoff = now - 60
+        while window and window[0] < cutoff:
+            window.pop(0)
+        if len(window) >= limit:
+            return False
+        window.append(now)
+        return True
 
 
 # ---- 响应缓存：仅缓存显式 temperature=0 的非流式成功响应
@@ -1691,6 +1719,13 @@ def _chat_chunk(stream_id: str, model: str, delta: dict, finish_reason=None, usa
 
 def _protocol_request(channel, protocol: str, body: dict, upstream_model: str, stream: bool,
                       request: Request | None = None):
+    if protocol == "access_gemini":
+        from . import gemini_access
+        url, payload = gemini_access.build_stream_request(
+            body, upstream_model, channel["_account_project"],
+            str(request.headers.get("x-session-id") or request.headers.get("x-request-id") or upstream_model) if request else upstream_model,
+        )
+        return url, payload, build_channel_headers(channel, channel["_account_headers"], request, protocol)
     if protocol == "openai_responses":
         url = normalize_openai_responses_base_url(channel["base_url"]) + "/v1/responses"
         headers = {"Authorization": f"Bearer {channel['api_key']}", "Content-Type": "application/json"}
@@ -1744,6 +1779,10 @@ async def _protocol_completion(channel, protocol: str, body: dict, public_model:
 
 
 def _protocol_event(event: dict, protocol: str, state: dict, model: str):
+    if protocol == "access_gemini":
+        if isinstance(event, dict) and isinstance(event.get("response"), dict):
+            event = event["response"]
+        protocol = "gemini"
     if not isinstance(event, dict):
         return None, False, True, "SSE data 顶层不是对象"
     if event.get("type") in {"error", "response.failed"} or event.get("error"):
@@ -1877,7 +1916,8 @@ async def _begin_protocol_stream(channel, protocol: str, body: dict, public_mode
             return None, response.status_code, message, "client_restricted" if _is_client_restricted(detail) else "server_error"
         events = []
         state = {}
-        stream_lines = response.aiter_lines()
+        from .sse import iter_sse_json_lines
+        stream_lines = iter_sse_json_lines(response.aiter_lines())
         while True:
             try:
                 line = await anext(stream_lines)
@@ -1909,21 +1949,24 @@ async def _begin_protocol_stream(channel, protocol: str, body: dict, public_mode
         return (client, response, stream_lines, events), 200, "", ""
     except httpx.RequestError as exc:
         return None, 502, upstream_error_message(channel["name"], 502, _request_error_detail(exc), channel["api_key"]), "server_error"
+    except (TypeError, ValueError):
+        return None, 502, _protocol_error_message(channel["name"], "SSE 帧格式不兼容", channel["api_key"]), "server_error"
     finally:
         if not handed_off:
-            try:
-                if response is not None:
-                    await response.aclose()
-            finally:
-                await client.aclose()
+            with CancelScope(shield=True):
+                try:
+                    if response is not None:
+                        await response.aclose()
+                finally:
+                    await client.aclose()
 
 
 async def _protocol_stream_relay(attempt, channel, protocol, public_model, finalize, pt_est):
     client, response, stream_lines, prefetched = attempt
     state = {}
     normal_end = False
+    cancelled = False
     error = ""
-    usage = {}
     try:
         for event in prefetched:
             chunk, _, is_error, detail = _protocol_event(event, protocol, state, public_model)
@@ -1961,9 +2004,24 @@ async def _protocol_stream_relay(attempt, channel, protocol, public_model, final
         if not error and normal_end and state.get("output") and not state.get("finish_sent"):
             state["finish_sent"] = True
             yield _chat_chunk(state.get("stream_id", ""), state.get("model", public_model), {}, "stop")
+    except (asyncio.CancelledError, GeneratorExit):
+        cancelled = not state.get("completed") and not error
+        raise
+    except Exception as exc:  # noqa: BLE001
+        error = upstream_error_message(channel["name"], 502, _request_error_detail(exc), channel["api_key"])
+        yield ("data: " + json.dumps({"error": {"message": error, "type": "server_error", "code": 502}}, ensure_ascii=False) + "\n\n").encode()
+    finally:
+        with CancelScope(shield=True):
+            try:
+                await response.aclose()
+            finally:
+                await client.aclose()
         usage = state.get("usage") if isinstance(state.get("usage"), dict) else {}
         pt, ct, usage_source = _usage_or_estimate(usage, pt_est, 0)
-        if error:
+        if cancelled:
+            finalize(channel, pt, ct, "error", 499, "客户端已断开连接，流式请求已取消",
+                     breaker_failure=False, usage_source=usage_source)
+        elif error:
             finalize(channel, pt, ct, "error", 502, error, breaker_failure=True,
                      usage_source=usage_source)
         elif state.get("incomplete"):
@@ -1971,16 +2029,6 @@ async def _protocol_stream_relay(attempt, channel, protocol, public_model, final
                      breaker_failure=False, usage_source=usage_source)
         else:
             finalize(channel, pt, ct, "success", 200, usage_source=usage_source)
-    except Exception as exc:  # noqa: BLE001
-        error = upstream_error_message(channel["name"], 502, _request_error_detail(exc), channel["api_key"])
-        yield ("data: " + json.dumps({"error": {"message": error, "type": "server_error", "code": 502}}, ensure_ascii=False) + "\n\n").encode()
-        finalize(channel, pt_est, 0, "error", 502, error, breaker_failure=True,
-                 usage_source="estimated")
-    finally:
-        try:
-            await response.aclose()
-        finally:
-            await client.aclose()
     yield b"data: [DONE]\n\n"
 
 
@@ -2103,12 +2151,36 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
             if disconnected:
                 return _error(499, "客户端已断开连接，停止重试。", "client_disconnected", request_id=rid)
         has_next_channel = attempt_index + 1 < len(candidates)
-        _channel_rate_consume(ch["id"], _int_field(ch, "rpm_limit"))
+        if not _channel_rate_consume(ch["id"], _int_field(ch, "rpm_limit")):
+            if has_next_channel:
+                continue
+            response = _error(429, f"公开模型 {model} 的候选渠道已达到速率上限，请稍后重试。", "channel_rate_limited", request_id=rid)
+            response.headers["Retry-After"] = "60"
+            return response
         protocol = channel_protocol(ch)
         outbound_body = dict(body)
         outbound_body["model"] = upstream_model_for_channel(ch, model)
         if ch["tool_policy"] == "strip":
             outbound_body = _without_tools(outbound_body)
+        from . import account_transport
+        if protocol in account_transport.ACCOUNT_TYPES:
+            try:
+                ch = await account_transport.prepare_channel(ch, outbound_body, stream)
+                if ch.get("_updated_credential") is not None:
+                    execute("UPDATE channels SET api_key=? WHERE id=?",
+                            (json.dumps(ch["_updated_credential"], ensure_ascii=False), ch["id"]))
+                protocol = ch["type"]
+            except ValueError as exc:
+                # Locally generated validation errors contain no credential values.
+                last_error = f"账号渠道请求或凭据不支持：{exc}"
+                finalize(ch, 0, 0, "error", 400, last_error, False, breaker_failure=False)
+                return _error(400, last_error, "invalid_request_error", request_id=rid)
+            except Exception:
+                last_error = "账号凭据刷新失败，请重新登录。"
+                finalize(ch, 0, 0, "error", 401, last_error, has_next_channel)
+                if has_next_channel:
+                    continue
+                return _error(401, last_error, "credential_expired", request_id=rid)
         try:
             if protocol == "openai_chat":
                 _prepare_openai_reasoning(ch, outbound_body)
@@ -2120,6 +2192,42 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
             finalize(ch, None, None, "error", 400, last_error, False, breaker_failure=False)
             return _error(400, last_error, "invalid_request_error", request_id=rid)
         attempt_diagnostic = _request_diagnostic(body, outbound_body, endpoint, stream, protocol)
+        if isinstance(ch, dict) and ch.get("_account_family"):
+            if not stream:
+                try:
+                    async with _http_client(ch, stream=True) as client:
+                        account_result, account_code, account_error = await account_transport.complete_nonstream(
+                            client, ch, outbound_body, model)
+                except Exception:
+                    # An account endpoint may include credential material in an error body.
+                    account_result, account_code, account_error = None, 502, "账号上游响应无效或流式连接异常结束"
+                if account_result is None:
+                    last_error = upstream_error_message(ch["name"], account_code, account_error, ch["api_key"])
+                    will_retry = has_next_channel and _retry_allowed(account_code, last_error)
+                    finalize(ch, 0, 0, "error", account_code, last_error, will_retry)
+                    if will_retry:
+                        await _retry_pause(attempt_index)
+                        continue
+                    return _error(account_code if account_code in {401, 403, 429} else 502,
+                                  last_error, "server_error", request_id=rid)
+                state = _chat_response_state(account_result)
+                if ((account_result.get("choices") or [{}])[0].get("finish_reason")) in {"length", "max_tokens"}:
+                    state = "incomplete"
+                usage = account_result.get("usage") or {}
+                message = ((account_result.get("choices") or [{}])[0].get("message") or {})
+                pt, ct, usage_source = _usage_or_estimate(usage, pt_est, _est_tokens(len(str(message.get("content") or ""))))
+                if state == "incomplete":
+                    finalize(ch, pt, ct, "error", 200, _incomplete_response_detail(account_result), False,
+                             breaker_failure=False, usage_source=usage_source)
+                    return JSONResponse(account_result, headers={"X-Request-ID": rid, "X-OBSESSIONAPI-Completion-State": "incomplete"})
+                if state != "valid":
+                    last_error = "账号上游没有返回有效文本、拒答或工具调用"
+                    finalize(ch, pt, ct, "error", 502, last_error, has_next_channel)
+                    if has_next_channel:
+                        continue
+                    return _error(502, last_error, "server_error", request_id=rid)
+                finalize(ch, pt, ct, "success", 200, usage_source=usage_source, result=account_result)
+                return JSONResponse(account_result, headers={"X-Request-ID": rid})
         # ---- 本地模拟渠道
         if protocol == "mock":
             if stream:
@@ -2143,7 +2251,7 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                      usage_source="synthetic", result=result)
             return JSONResponse(result, headers={"X-Request-ID": rid})
 
-        if protocol in {"openai_responses", "gemini"}:
+        if protocol in {"openai_responses", "gemini", "access_gemini"}:
             if not stream:
                 result, result_code, result_message, result_type = await _protocol_completion(
                     ch, protocol, outbound_body, model, request
@@ -2177,9 +2285,14 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                     await _retry_pause(attempt_index)
                     continue
                 return _error(502, last_error, result_type or "server_error", request_id=rid)
-            attempt, result_code, result_message, result_type = await _begin_protocol_stream(
-                ch, protocol, outbound_body, model, request
-            )
+            try:
+                attempt, result_code, result_message, result_type = await _begin_protocol_stream(
+                    ch, protocol, outbound_body, model, request
+                )
+            except (asyncio.CancelledError, GeneratorExit):
+                finalize(ch, 0, 0, "error", 499, "客户端已断开连接，流式请求已取消",
+                         breaker_failure=False)
+                raise
             if attempt is not None:
                 return StreamingResponse(
                     _protocol_stream_relay(attempt, ch, protocol, model, finalize, pt_est),
@@ -2202,13 +2315,14 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
         # ---- Anthropic Messages 上游：只在网关内部转换，外部仍保持 OpenAI 协议
         if protocol == "anthropic":
             try:
-                url = normalize_anthropic_base_url(ch["base_url"]) + "/v1/messages"
-                anthropic_body = _openai_to_anthropic(outbound_body)
+                account_family = ch.get("_account_family") if isinstance(ch, dict) else None
+                url = ch["_account_url"] if account_family else normalize_anthropic_base_url(ch["base_url"]) + "/v1/messages"
+                anthropic_body = account_transport.anthropic_payload(outbound_body) if account_family else _openai_to_anthropic(outbound_body)
             except ValueError as exc:
                 last_error = _anthropic_error_message(ch, ch["base_url"], 400, str(exc))
                 finalize(ch, 0, 0, "error", 400, last_error, False, breaker_failure=False)
                 return _error(400, last_error, "invalid_request_error", request_id=rid)
-            headers = build_channel_headers(ch, anthropic_headers(ch["api_key"]), request, "anthropic")
+            headers = build_channel_headers(ch, ch["_account_headers"] if account_family else anthropic_headers(ch["api_key"]), request, "anthropic")
 
             if not stream:
                 try:
@@ -2258,6 +2372,12 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
             try:
                 req = client.build_request("POST", url, json=anthropic_body, headers=headers)
                 resp = await client.send(req, stream=True)
+            except (asyncio.CancelledError, GeneratorExit):
+                with CancelScope(shield=True):
+                    await client.aclose()
+                finalize(ch, 0, 0, "error", 499, "客户端已断开连接，流式请求已取消",
+                         breaker_failure=False, usage_source="unknown")
+                raise
             except Exception as exc:  # noqa: BLE001
                 await client.aclose()
                 last_error = _anthropic_error_message(ch, url, 502, _request_error_detail(exc))
@@ -2266,10 +2386,19 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
             if resp.status_code != 200:
                 content_type = resp.headers.get("content-type", "")
                 retry_after_ms = _parse_retry_after_ms(resp.headers)
-                text = (await resp.aread()).decode(errors="replace")[:300]
-                status_code = resp.status_code
-                await resp.aclose()
-                await client.aclose()
+                try:
+                    text = (await resp.aread()).decode(errors="replace")[:300]
+                    status_code = resp.status_code
+                except (asyncio.CancelledError, GeneratorExit):
+                    finalize(ch, 0, 0, "error", 499, "客户端已断开连接，流式请求已取消",
+                             breaker_failure=False, usage_source="unknown")
+                    raise
+                finally:
+                    with CancelScope(shield=True):
+                        try:
+                            await resp.aclose()
+                        finally:
+                            await client.aclose()
                 if _tools_unsupported(text, outbound_body):
                     last_error = _tool_not_supported_message(ch["name"])
                     finalize(ch, 0, 0, "error", 400, last_error, has_next_channel, breaker_failure=False)
@@ -2285,7 +2414,7 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                     continue
                 return _error(502, last_error, "server_error", request_id=rid)
 
-            stream_lines = resp.aiter_lines()
+            stream_lines = iter_sse_json_lines(resp.aiter_lines())
             prefetched = []
             prefetch_error = None
             prefetch_error_message = None
@@ -2328,6 +2457,15 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                     if event.get("type") == "message_stop":
                         prefetch_normal_end = True
                         break
+            except (asyncio.CancelledError, GeneratorExit):
+                with CancelScope(shield=True):
+                    try:
+                        await resp.aclose()
+                    finally:
+                        await client.aclose()
+                finalize(ch, 0, 0, "error", 499, "客户端已断开连接，流式请求已取消",
+                         breaker_failure=False, usage_source="unknown")
+                raise
             except StopAsyncIteration:
                 prefetch_eof = True
             except Exception as exc:  # noqa: BLE001
@@ -2350,7 +2488,9 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
             if pre_output_error and not prefetch_has_output:
                 await resp.aclose()
                 await client.aclose()
-                if "tools" not in outbound_body:
+                fallback_code = 502  # 无兜底路径时的缺省，供末尾状态映射
+                if "tools" not in outbound_body and not (isinstance(ch, dict) and ch.get("_account_family")):
+                    fallback_code = 502
                     fallback_result, fallback_code, fallback_message = await _fallback_anthropic_completion(
                         ch, url, outbound_body, headers, model
                     )
@@ -2403,6 +2543,8 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                 if has_next_channel:
                     await _retry_pause(attempt_index)
                     continue
+                if fallback_code == 429:
+                    return _error(429, last_error, "channel_rate_limited", request_id=rid)
                 return _error(502, last_error, "server_error", request_id=rid)
 
             async def relay_anthropic(ch=ch, client=client, resp=resp, prefetched=prefetched, stream_lines=stream_lines):
@@ -2413,11 +2555,13 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                 stream_error = None
                 stream_error_code = 502
                 tool_capability_error = False
+                stream_error_sent = False
                 role_sent = False
                 output_started = False
                 finish_sent = False
                 normal_end = False
                 done_sent = False
+                cancelled = False
                 stream_id = ""
                 stream_model = model
                 tool_blocks = {}
@@ -2483,6 +2627,7 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                                     stream_error = _tool_not_supported_message(ch["name"])
                                 else:
                                     stream_error = _anthropic_error_message(ch, url, 502, detail)
+                                stream_error_sent = True
                                 yield ("data: " + json.dumps({"error": {
                                     "message": stream_error,
                                     "type": "tool_not_supported" if tool_capability_error else "server_error",
@@ -2534,6 +2679,11 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                                     usage_seen["v"] = True
                                 reason = delta.get("stop_reason")
                                 if reason and not finish_sent:
+                                    tail = tail_filter.finish()
+                                    tail_filter = _SeekAITailFilter()
+                                    if tail:
+                                        ct_chars["n"] += len(tail)
+                                        yield chunk(with_role({"content": tail}))
                                     finish_sent = True
                                     yield chunk({}, _anthropic_stop_reason(reason), {
                                         "prompt_tokens": real_usage["pt"],
@@ -2544,6 +2694,11 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                             if event_type == "message_stop":
                                 normal_end = True
                                 if output_started and not finish_sent:
+                                    tail = tail_filter.finish()
+                                    tail_filter = _SeekAITailFilter()
+                                    if tail:
+                                        ct_chars["n"] += len(tail)
+                                        yield chunk(with_role({"content": tail}))
                                     finish_sent = True
                                     yield chunk({}, "stop")
                                 break
@@ -2551,6 +2706,11 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                         stream_error = _anthropic_error_message(ch, url, 502, _request_error_detail(exc))
                     if not normal_end and not stream_error:
                         stream_error = _anthropic_error_message(ch, url, 502, "流式响应异常结束")
+                    if stream_error and not stream_error_sent:
+                        stream_error_sent = True
+                        yield ("data: " + json.dumps({"error": {
+                            "message": stream_error, "type": "server_error", "code": stream_error_code,
+                        }}, ensure_ascii=False) + "\n\n").encode()
                     tail = tail_filter.finish()
                     if tail and output_started and not stream_error:
                         ct_chars["n"] += len(tail)
@@ -2561,14 +2721,24 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                     if not done_sent:
                         yield b"data: [DONE]\n\n"
                         done_sent = True
+                except (asyncio.CancelledError, GeneratorExit):
+                    cancelled = not normal_end and not stream_error
+                    raise
                 finally:
-                    await resp.aclose()
-                    await client.aclose()
+                    with CancelScope(shield=True):
+                        try:
+                            await resp.aclose()
+                        finally:
+                            await client.aclose()
                     if usage_seen["v"]:
                         usage_pt, usage_ct, usage_source = real_usage["pt"], real_usage["ct"], "upstream"
                     else:
                         usage_pt, usage_ct, usage_source = pt_est, _est_tokens(ct_chars["n"]), "estimated"
-                    if stream_error:
+                    if cancelled:
+                        finalize(ch, usage_pt, usage_ct, "error", 499,
+                                 "客户端已断开连接，流式请求已取消", breaker_failure=False,
+                                 usage_source=usage_source)
+                    elif stream_error:
                         finalize(ch, usage_pt, usage_ct, "error", stream_error_code,
                                  stream_error, breaker_failure=not tool_capability_error,
                                  usage_source=usage_source)
@@ -2580,80 +2750,6 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
         # ---- OpenAI 兼容上游（失败自动切换到下一个候选渠道）
         # opencode_free 渠道复用 OpenAI Chat 通道：仅替换 URL、鉴权头与请求体（指纹协议），
         # 流式/非流式/重试/熔断全部复用下方现成逻辑。
-        # ---- LobsterAI（有道）账号渠道：OAuth 凭据 + OpenAI 形状转发 + 401 自动刷新
-        if protocol == "lobsterai":
-            try:
-                lb_credential = lobsterai.parse_credential(ch["api_key"])
-            except ValueError as exc:
-                last_error = f"LobsterAI 渠道凭据无效：{exc}；请在渠道页重新登录。"
-                finalize(ch, 0, 0, "error", 400, last_error, False, breaker_failure=False)
-                return _error(400, last_error, "invalid_channel_credential", request_id=rid)
-            lb_credential = await lobsterai.ensure_fresh(lb_credential)
-            lb_url = lobsterai.API_BASE + lobsterai.CHAT_PATH
-            outbound_body = dict(outbound_body)
-            outbound_body.pop("stream", None)
-            for lb_attempt in range(2):
-                lb_headers = lobsterai.chat_headers(
-                    lb_credential["access_token"],
-                    lb_credential.get("version") or lobsterai.FALLBACK_VERSION,
-                    sse=bool(stream),
-                )
-                try:
-                    if stream:
-                        client = _http_client(ch, stream=True)
-                        req = client.build_request("POST", lb_url, json=outbound_body, headers=lb_headers)
-                        resp = await client.send(req, stream=True)
-                    else:
-                        async with _http_client(ch) as client:
-                            resp = await client.post(lb_url, json=outbound_body, headers=lb_headers)
-                except Exception as exc:  # noqa: BLE001
-                    last_error = upstream_error_message(ch["name"], 502, _request_error_detail(exc), "")
-                    finalize(ch, 0, 0, "error", 502, last_error, has_next_channel)
-                    if has_next_channel:
-                        await _retry_pause(attempt_index)
-                        continue
-                    return _error(502, last_error, "server_error", request_id=rid)
-                if resp.status_code in (401, 403) and lb_attempt == 0 and lobsterai.is_refreshable(lb_credential):
-                    await resp.aclose()
-                    if stream:
-                        await client.aclose()
-                    try:
-                        lb_credential = await lobsterai.refresh(lb_credential)
-                        execute("UPDATE channels SET api_key=? WHERE id=?", (lobsterai.credential_json(lb_credential), ch["id"]))
-                        continue
-                    except Exception:  # noqa: BLE001
-                        last_error = "LobsterAI 凭据过期且自动刷新失败，请重新登录。"
-                        finalize(ch, 0, 0, "error", 401, last_error, False, breaker_failure=False)
-                        return _error(401, last_error, "credential_expired", request_id=rid)
-                break
-            if resp.status_code != 200:
-                lb_detail = (await resp.aread()).decode(errors="replace")[:300]
-                if stream:
-                    await client.aclose()
-                last_error = upstream_error_message(ch["name"], resp.status_code, lb_detail, "")
-                will_retry = has_next_channel and _retry_allowed(resp.status_code, last_error)
-                finalize(ch, 0, 0, "error", resp.status_code, last_error, will_retry, retry_after_ms=_parse_retry_after_ms(resp.headers))
-                if will_retry:
-                    await _retry_pause(attempt_index)
-                    continue
-                return _error(resp.status_code, last_error, "server_error", request_id=rid)
-            if not stream:
-                try:
-                    lb_result = resp.json()
-                    lb_message = ((lb_result.get("choices") or [{}])[0].get("message") or {})
-                    if isinstance(lb_message.get("content"), str):
-                        lb_message["content"] = strip_seekai_attribution(lb_message["content"])
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    last_error = upstream_error_message(ch["name"], 502, "LobsterAI 响应格式不兼容", "")
-                    finalize(ch, 0, 0, "error", 502, last_error, has_next_channel)
-                    if has_next_channel:
-                        continue
-                    return _error(502, last_error, "server_error", request_id=rid)
-                lb_usage = lb_result.get("usage") or {}
-                pt, ct, usage_source = _usage_or_estimate(lb_usage, pt_est, _est_tokens(len(str(lb_message.get("content") or ""))))
-                finalize(ch, pt, ct, "success", 200, usage_source=usage_source, result=lb_result)
-                return JSONResponse(lb_result, headers={"X-Request-ID": rid})
-
         oc_free = protocol == "opencode_free"
         if oc_free:
             url = opencode_free.OPENCODE_BASE + "/inference/v1/chat/completions"
@@ -2683,17 +2779,21 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                 if isinstance(message.get("content"), str):
                     message["content"] = strip_seekai_attribution(message["content"])
                 pt, ct, usage_source = _usage_or_estimate(oc_result.get("usage") or {}, pt_est, _est_tokens(len(str(message.get("content") or ""))))
+                if ((oc_result.get("choices") or [{}])[0].get("finish_reason")) in {"length", "max_tokens"}:
+                    finalize(ch, pt, ct, "error", 200, _incomplete_response_detail(oc_result), False,
+                             breaker_failure=False, usage_source=usage_source)
+                    return JSONResponse(oc_result, headers={"X-Request-ID": rid, "X-OBSESSIONAPI-Completion-State": "incomplete"})
                 finalize(ch, pt, ct, "success", 200, usage_source=usage_source, result=oc_result)
                 return JSONResponse(oc_result, headers={"X-Request-ID": rid})
         else:
             try:
-                url = normalize_openai_base_url(ch["base_url"]) + "/chat/completions"
+                url = ch["_account_url"] if isinstance(ch, dict) and ch.get("_account_family") else normalize_openai_base_url(ch["base_url"]) + "/chat/completions"
             except ValueError as exc:
                 last_error = upstream_error_message(ch["name"], 502, str(exc), ch["api_key"])
                 finalize(ch, 0, 0, "error", 502, last_error, has_next_channel)
                 continue
             headers = build_channel_headers(
-                ch, {"Authorization": f"Bearer {ch['api_key']}", "Content-Type": "application/json"},
+                ch, ch["_account_headers"] if isinstance(ch, dict) and ch.get("_account_family") else {"Authorization": f"Bearer {ch['api_key']}", "Content-Type": "application/json"},
                 request, "openai_chat"
             )
 
@@ -2702,6 +2802,12 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
             try:
                 req = client.build_request("POST", url, json=outbound_body, headers=headers)
                 resp = await client.send(req, stream=True)
+            except (asyncio.CancelledError, GeneratorExit):
+                with CancelScope(shield=True):
+                    await client.aclose()
+                finalize(ch, 0, 0, "error", 499, "客户端已断开连接，流式请求已取消",
+                         breaker_failure=False, usage_source="unknown")
+                raise
             except Exception as exc:  # noqa: BLE001
                 await client.aclose()
                 last_error = upstream_error_message(
@@ -2711,10 +2817,19 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                 continue
             if resp.status_code != 200:
                 content_type = resp.headers.get("content-type", "")
-                text = (await resp.aread()).decode(errors="replace")[:300]
-                status_code = resp.status_code
-                await resp.aclose()
-                await client.aclose()
+                try:
+                    text = (await resp.aread()).decode(errors="replace")[:300]
+                    status_code = resp.status_code
+                except (asyncio.CancelledError, GeneratorExit):
+                    finalize(ch, 0, 0, "error", 499, "客户端已断开连接，流式请求已取消",
+                             breaker_failure=False, usage_source="unknown")
+                    raise
+                finally:
+                    with CancelScope(shield=True):
+                        try:
+                            await resp.aclose()
+                        finally:
+                            await client.aclose()
                 if _tools_unsupported(text, outbound_body):
                     last_error = _tool_not_supported_message(ch["name"])
                     finalize(ch, 0, 0, "error", 400, last_error, has_next_channel, breaker_failure=False)
@@ -2732,7 +2847,7 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                         continue
                     return _error(502, last_error, "client_restricted" if _is_client_restricted(text) else "server_error", request_id=rid)
 
-            stream_lines = resp.aiter_lines()
+            stream_lines = iter_sse_json_lines(resp.aiter_lines())
             prefetched = []
             prefetch_error = None
             prefetch_eof = False
@@ -2828,6 +2943,15 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                     if has_output:
                         prefetch_has_output = True
                         break
+            except (asyncio.CancelledError, GeneratorExit):
+                with CancelScope(shield=True):
+                    try:
+                        await resp.aclose()
+                    finally:
+                        await client.aclose()
+                finalize(ch, 0, 0, "error", 499, "客户端已断开连接，流式请求已取消",
+                         breaker_failure=False, usage_source="unknown")
+                raise
             except StopAsyncIteration:
                 prefetch_eof = True
             except Exception as exc:  # noqa: BLE001
@@ -2888,7 +3012,7 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                 )
                 await resp.aclose()
                 await client.aclose()
-                if "tools" not in outbound_body:
+                if "tools" not in outbound_body and not (isinstance(ch, dict) and ch.get("_account_family")):
                     fallback_result, fallback_code, fallback_message = await _fallback_completion(
                         ch, url, outbound_body, headers
                     )
@@ -2906,6 +3030,8 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                              usage_source=usage_source)
                 if has_next_channel:
                     continue
+                if fallback_code == 429:
+                    return _error(429, last_error, "channel_rate_limited", request_id=rid)
                 return _error(502, last_error, "server_error", request_id=rid)
 
             async def relay(ch=ch, client=client, resp=resp, prefetched=prefetched, stream_lines=stream_lines):
@@ -2923,6 +3049,7 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                 finish_reason_seen = False
                 upstream_done = False
                 done_sent = False
+                cancelled = False
                 try:
                     async def lines():
                         for line in prefetched:
@@ -2962,8 +3089,8 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                                     last_output_event = obj
                                 if content:
                                     last_content_event = obj
-                            except Exception:
-                                obj, content, finish_reason = None, None, None
+                            except Exception as exc:
+                                raise ValueError("SSE data 不是合法的 Chat Completions 对象") from exc
                             if obj and obj.get("error"):
                                 error = obj["error"] if isinstance(obj["error"], dict) else {}
                                 error_text = error.get("message", "流式上游返回错误")
@@ -2983,11 +3110,24 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                                         "code": stream_error_code,
                                     }
                                 }, ensure_ascii=False) + "\n\n").encode()
-                                continue
-                            if obj is None or content is None:
+                                break
+                            if content is None:
+                                if finish_reason:
+                                    tail = tail_filter.finish()
+                                    tail_filter = _SeekAITailFilter()
+                                    if tail and last_content_event:
+                                        tail_event = json.loads(json.dumps(last_content_event))
+                                        tail_event["choices"][0]["delta"] = {"content": tail}
+                                        tail_event["choices"][0]["finish_reason"] = None
+                                        tail_event.pop("usage", None)
+                                        ct_chars["n"] += len(tail)
+                                        yield ("data: " + json.dumps(tail_event, ensure_ascii=False) + "\n\n").encode()
                                 yield (line + "\n\n").encode()
                                 continue
                             replacement = tail_filter.feed(content)
+                            if finish_reason:
+                                replacement += tail_filter.finish()
+                                tail_filter = _SeekAITailFilter()
                             if not replacement:
                                 if finish_reason:
                                     obj["choices"][0]["delta"] = {}
@@ -3015,7 +3155,7 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                             }, ensure_ascii=False) + "\n\n").encode()
                             stream_error_sent = True
                     tail = tail_filter.finish()
-                    if tail and last_content_event:
+                    if tail and last_content_event and not stream_error:
                         tail_event = json.loads(json.dumps(last_content_event))
                         tail_event["choices"][0]["delta"]["content"] = tail
                         ct_chars["n"] += len(tail)
@@ -3040,15 +3180,25 @@ async def _chat_inner(request: Request, body: dict, endpoint: str = "/v1/chat/co
                     if not done_sent:
                         yield b"data: [DONE]\n\n"
                         done_sent = True
+                except (asyncio.CancelledError, GeneratorExit):
+                    cancelled = not upstream_done and not stream_error
+                    raise
                 finally:
-                    await resp.aclose()
-                    await client.aclose()
+                    with CancelScope(shield=True):
+                        try:
+                            await resp.aclose()
+                        finally:
+                            await client.aclose()
                     # 上游流式响应通常不带 usage，缺省时按内容长度估算，保证用量记录不断档
                     if usage_seen["v"]:
                         usage_pt, usage_ct, usage_source = real_usage["pt"], real_usage["ct"], "upstream"
                     else:
                         usage_pt, usage_ct, usage_source = pt_est, _est_tokens(ct_chars["n"]), "estimated"
-                    if stream_error:
+                    if cancelled:
+                        finalize(ch, usage_pt, usage_ct, "error", 499,
+                                 "客户端已断开连接，流式请求已取消", breaker_failure=False,
+                                 usage_source=usage_source)
+                    elif stream_error:
                         finalize(ch, usage_pt, usage_ct, "error", stream_error_code,
                                  stream_error, breaker_failure=not tool_capability_error,
                                  usage_source=usage_source)
@@ -3145,17 +3295,22 @@ async def _chat(request: Request, body: dict, endpoint: str = "/v1/chat/completi
     rid = request_id or secrets.token_hex(8)
     if not isinstance(body, dict) or body.get("stream"):
         return await _chat_inner(request, body, endpoint, rid)
+    return await _with_key_concurrency(_chat_inner, request, body, endpoint, rid)
+
+
+async def _with_key_concurrency(handler, request: Request, body: dict, endpoint: str, rid: str):
+    """所有非流式生成/向量请求共享同一个 Key 并发预算。"""
     key_row = _auth_key(request)
     limit = _int_field(key_row, "concurrency_limit") if key_row is not None else 0
     if limit <= 0:
-        return await _chat_inner(request, body, endpoint, rid)
+        return await handler(request, body, endpoint, rid)
     if _key_concurrency_exceeded(key_row["id"], limit):
         response = _error(429, f"该 API Key 并发请求数已达上限（{limit}）。", "concurrency_limit_exceeded", request_id=rid)
         response.headers["Retry-After"] = "1"
         return response
     _key_acquire(key_row["id"])
     try:
-        return await _chat_inner(request, body, endpoint, rid)
+        return await handler(request, body, endpoint, rid)
     finally:
         _key_release(key_row["id"])
 
@@ -3206,6 +3361,11 @@ def _mock_embedding(body: dict, model: str) -> dict:
 
 async def _embeddings(request: Request, body: dict, endpoint: str = "/v1/embeddings", request_id: str = ""):
     """OpenAI 兼容 embeddings 转发：复用鉴权、白名单、限流、熔断与用量记录。"""
+    rid = request_id or secrets.token_hex(8)
+    return await _with_key_concurrency(_embeddings_inner, request, body, endpoint, rid)
+
+
+async def _embeddings_inner(request: Request, body: dict, endpoint: str, request_id: str):
     start = time.perf_counter()
     ip = request.client.host if request.client else ""
     rid = request_id or secrets.token_hex(8)
@@ -3256,7 +3416,12 @@ async def _embeddings(request: Request, body: dict, endpoint: str = "/v1/embeddi
             if disconnected:
                 return _error(499, "客户端已断开连接，停止重试。", "client_disconnected", request_id=rid)
         has_next_channel = attempt_index + 1 < len(candidates)
-        _channel_rate_consume(ch["id"], _int_field(ch, "rpm_limit"))
+        if not _channel_rate_consume(ch["id"], _int_field(ch, "rpm_limit")):
+            if has_next_channel:
+                continue
+            response = _error(429, f"公开模型 {model} 的候选渠道已达到速率上限，请稍后重试。", "channel_rate_limited", request_id=rid)
+            response.headers["Retry-After"] = "60"
+            return response
         protocol = channel_protocol(ch)
         outbound_body = dict(body)
         outbound_body["model"] = upstream_model_for_channel(ch, model)
