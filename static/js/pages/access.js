@@ -21,7 +21,7 @@ export async function renderAccess(el, { navigate, initialFilters = {}, isCurren
     const result = await api("/account-channels");
     const grid = $("#acc-grid");
     grid.innerHTML = result.cards.map((c) => cardHtml(c)).join("");
-    grid.querySelectorAll("[data-add-account]").forEach((b) => { b.onclick = () => addAccount(b.dataset.addAccount); });
+    grid.querySelectorAll("[data-add-account]").forEach((b) => { b.onclick = () => addAccount(b.dataset.addAccount, Number(b.dataset.channelId || 0)); });
     grid.querySelectorAll("[data-relogin]").forEach((b) => { b.onclick = () => relogin(b, b.dataset.relogin, Number(b.dataset.channelId || 0)); });
     grid.querySelectorAll("[data-refresh-balance]").forEach((b) => { b.onclick = () => refreshBalance(b, b.dataset.refreshBalance); });
     grid.querySelectorAll("[data-signin]").forEach((b) => { b.onclick = () => doSignin(b, b.dataset.signin); });
@@ -45,8 +45,46 @@ function cardHtml(c) {
     `</article>`;
 }
 
-async function addAccount(family) {
-  toast("请先到渠道页创建对应类型渠道，再回来登录", "info");
+async function addAccount(family, channelId) {
+  if (channelId) return startLoginFlow(family, channelId);
+  const typeMap = { lobsterai: "lobsterai", gemini: "access_gemini", minimax: "access_minimax", cline: "access_cline" };
+  const type = typeMap[family];
+  if (!type) { toast("该家族暂不支持一键接入", "info"); return; }
+  try {
+    const created = await api("/channels", { method: "POST", body: JSON.stringify({ name: META[family].label + "-" + Date.now() % 100000, type, api_key: "", models: "" }) });
+    if (created.id) { toast("渠道已创建，开始登录", "success"); await startLoginFlow(family, created.id); }
+  } catch (e) { toast("创建渠道失败：" + e.message, "err"); }
+}
+
+async function startLoginFlow(family, channelId) {
+  if (family === "lobsterai") return reloginDirect(channelId);
+  try {
+    const start = await api("/account-channels/login/start", { method: "POST", body: JSON.stringify({ family, channel_id: channelId }) });
+    if (!start.ok) { toast(start.error || "暂不支持", "err"); return; }
+    if (start.login_url) window.open(start.login_url, "_blank");
+    else if (start.verify_url) { window.open(start.verify_url, "_blank"); toast("设备码：" + (start.user_code || ""), "info"); }
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 2500));
+      let poll;
+      try { poll = await api("/account-channels/login/poll?state=" + encodeURIComponent(start.state)); }
+      catch { toast("登录会话已结束", "err"); return; }
+      if (poll.status === "credential") {
+        const bind = await api("/account-channels/login/bind", { method: "POST", body: JSON.stringify({ state: start.state, channel_id: channelId }) });
+        toast("登录成功" + (bind.models_synced ? "，已同步 " + bind.models_synced + " 个模型" : ""), "success");
+        location.reload();
+        return;
+      }
+      if (poll.status === "error") { toast("登录失败：" + (poll.error || ""), "err"); return; }
+    }
+  } catch (e) { toast("发起失败：" + e.message, "err"); }
+}
+
+async function reloginDirect(channelId) {
+  try {
+    const start = await api("/channels/lobsterai/login/start", { method: "POST", body: JSON.stringify({ channel_id: channelId }) });
+    window.open(start.login_url, "_blank");
+    toast("已打开登录页，等待授权…", "info");
+  } catch (e) { toast("失败：" + e.message, "err"); }
 }
 
 async function relogin(button, family, channelId) {

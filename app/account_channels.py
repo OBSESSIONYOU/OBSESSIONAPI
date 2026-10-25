@@ -276,8 +276,25 @@ async def login_bind(request: Request):
     execute("UPDATE channels SET api_key=?, status=1 WHERE id=?",
             (_json.dumps(credential, ensure_ascii=False), int(channel_id)))
     nickname = credential.get("email") or credential.get("nickname") or ""
+    # Auto-sync roster after login (LobsterAI / MiniMax) so the channel is ready to serve
+    models_synced = 0
+    try:
+        ch_row = _one("SELECT type FROM channels WHERE id=?", (int(channel_id),))
+        family_type = ch_row["type"] if ch_row else ""
+        if family_type == "lobsterai":
+            ids = await lobsterai.list_models(credential)
+        elif family_type == "access_minimax":
+            from . import minimax_access
+            ids = await minimax_access.list_models(credential)
+        else:
+            ids = []
+        if ids:
+            execute("UPDATE channels SET models=? WHERE id=?", (",".join(ids[:40]), int(channel_id)))
+            models_synced = len(ids)
+    except Exception:
+        pass
     _LOGIN.pop(state, None)
-    return {"ok": True, "nickname": nickname}
+    return {"ok": True, "nickname": nickname, "models_synced": models_synced}
 
 
 @router.get("/login/poll")

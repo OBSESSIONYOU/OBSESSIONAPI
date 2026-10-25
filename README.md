@@ -64,6 +64,8 @@ Compose 只把宿主机本地端口映射到容器，并把现有 `data` 目录�
 
 Responses、Anthropic、Gemini 的函数工具调用及结果回传会转换到统一对话格式，并保留并行调用 ID。Responses 流包含输出项的开始、增量、结束事件与完整终态；输出预算耗尽返回 `incomplete`，不会把正常结束误判为渠道失败。跨协议工具结果目前支持文本；Responses 的 `previous_response_id` / `conversation` 服务端状态及内建工具暂不支持，会明确拒绝，调用方应传完整历史。详见 [2026-10-22 协议修复与验证记录](docs/2026-10-22-protocol-streaming-and-tools.md)。
 
+账号通道（Gemini Cloud Code、MiniMax、Cline、LobsterAI）使用专用传输，OpenCode 非流式桥会校验流终态；SSE 异常、客户端取消、故障切换限额和 embeddings 并发的修复范围见 [2026-10-25 修复记录](docs/2026-10-25-account-routing-and-stream-integrity.md)。账号接线已用离线协议夹具验证，真实登录与供应商推理需单独验收。
+
 ```powershell
 $headers = @{ Authorization = "Bearer $env:OBSESSION_KEY"; "Content-Type" = "application/json" }
 $body = (@{ model = "你的模型名"; messages = @(@{ role = "user"; content = "你好" }) } | ConvertTo-Json -Depth 8)
